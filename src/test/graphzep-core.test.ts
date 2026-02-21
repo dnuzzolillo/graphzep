@@ -14,13 +14,18 @@ describe('Graphzep Core', () => {
 
   const mockLLMClient = {
     generateResponse: mock.fn(async () => ({ content: 'test response' })),
-    generateStructuredResponse: mock.fn(async () => ({
-      entities: [
-        { name: 'Alice', entityType: 'Person', summary: 'A person named Alice' },
-        { name: 'Bob', entityType: 'Person', summary: 'A person named Bob' },
-      ],
-      relations: [{ sourceName: 'Alice', targetName: 'Bob', relationName: 'KNOWS' }],
-    })),
+    generateStructuredResponse: mock.fn(async (prompt: string) => {
+      if (prompt.includes('maintaining a knowledge graph')) {
+        return { mergedSummary: 'Updated summary with merged context' };
+      }
+      return {
+        entities: [
+          { name: 'Alice', entityType: 'Person', summary: 'A person named Alice' },
+          { name: 'Bob', entityType: 'Person', summary: 'A person named Bob' },
+        ],
+        relations: [{ sourceName: 'Alice', targetName: 'Bob', relationName: 'KNOWS' }],
+      };
+    }),
   };
 
   const mockEmbedder = {
@@ -116,6 +121,167 @@ describe('Graphzep Core', () => {
 
       assert.strictEqual(episode.groupId, customGroupId);
     });
+
+    it('should skip entities below confidence threshold', async () => {
+      mockLLMClient.generateStructuredResponse.mock.resetCalls();
+      (mockDriver.executeQuery as any).mock.resetCalls();
+
+      (mockDriver.executeQuery as any).mock.mockImplementation(async () => []);
+
+      mockLLMClient.generateStructuredResponse.mock.mockImplementationOnce(async () => ({
+        entities: [
+          { name: 'Alice', entityType: 'Person', summary: 'A person', confidence: 0.9 },
+          { name: 'SomeVagueRef', entityType: 'Concept', summary: 'Vague', confidence: 0.2 },
+        ],
+        relations: [],
+      }));
+
+      await graphzep.addEpisode({ content: 'Alice mentioned something vague.' });
+
+      const saveCalls = (mockDriver.executeQuery as any).mock.calls.filter((c: any) =>
+        c.arguments[0].includes('MERGE') && c.arguments[0].includes('Entity'),
+      );
+      // Only Alice (confidence 0.9) should be saved — SomeVagueRef (0.2) filtered out
+      // Filter to EntityNode saves specifically (MERGE (n:Entity), not edge MATCHes)
+      const entityNodeSaves = saveCalls.filter((c: any) =>
+        c.arguments[0].includes('MERGE (n:Entity'),
+      );
+      assert.strictEqual(entityNodeSaves.length, 1);
+    });
+
+    it('should skip negated relations', async () => {
+      (mockDriver.executeQuery as any).mock.resetCalls();
+      (mockDriver.executeQuery as any).mock.mockImplementation(async () => []);
+
+      mockLLMClient.generateStructuredResponse.mock.mockImplementationOnce(async () => ({
+        entities: [
+          { name: 'Alice', entityType: 'Person', summary: 'Alice', confidence: 0.9 },
+          { name: 'ACME', entityType: 'Organization', summary: 'ACME Corp', confidence: 0.9 },
+        ],
+        relations: [
+          {
+            sourceName: 'Alice',
+            targetName: 'ACME',
+            relationName: 'WORKS_AT',
+            confidence: 0.9,
+            isNegated: true,
+            temporalValidity: 'current',
+          },
+        ],
+      }));
+
+      await graphzep.addEpisode({ content: 'Alice does not work at ACME.' });
+
+      const edgeSaves = (mockDriver.executeQuery as any).mock.calls.filter((c: any) =>
+        c.arguments[0].includes('RELATES_TO'),
+      );
+      assert.strictEqual(edgeSaves.length, 0, 'Negated relation should not be saved');
+    });
+
+    it('should mark historical relations with invalidAt', async () => {
+      (mockDriver.executeQuery as any).mock.resetCalls();
+      (mockDriver.executeQuery as any).mock.mockImplementation(async (query: string) => {
+        if (query.includes('MATCH (s:Entity')) return []; // no existing edge
+        return [];
+      });
+
+      mockLLMClient.generateStructuredResponse.mock.mockImplementationOnce(async () => ({
+        entities: [
+          { name: 'Alice', entityType: 'Person', summary: 'Alice', confidence: 0.9 },
+          { name: 'OldCo', entityType: 'Organization', summary: 'Old company', confidence: 0.9 },
+        ],
+        relations: [
+          {
+            sourceName: 'Alice',
+            targetName: 'OldCo',
+            relationName: 'WORKED_AT',
+            confidence: 0.9,
+            isNegated: false,
+            temporalValidity: 'historical',
+          },
+        ],
+      }));
+
+      await graphzep.addEpisode({ content: 'Alice used to work at OldCo.' });
+
+      const edgeSaves = (mockDriver.executeQuery as any).mock.calls.filter((c: any) =>
+        c.arguments[0].includes('RELATES_TO') && c.arguments[0].includes('MERGE'),
+      );
+      assert(edgeSaves.length > 0, 'Historical relation should still be saved');
+      // invalidAt param should be set (non-null)
+      const edgeParams = edgeSaves[0].arguments[1];
+      assert(edgeParams?.invalidAt != null, 'Historical edge should have invalidAt set');
+    });
+
+    it('should merge summary when entity already exists', async () => {
+      const existingAlice = {
+        uuid: 'alice-uuid',
+        name: 'Alice',
+        entityType: 'Person',
+        summary: 'A junior developer at ACME',
+        groupId: 'test-group',
+        labels: ['Entity'],
+        createdAt: new Date(),
+      };
+
+      mockLLMClient.generateStructuredResponse.mock.resetCalls();
+      mockEmbedder.embed.mock.resetCalls();
+
+      (mockDriver.executeQuery as any).mock.mockImplementation(
+        async (query: string, params: any) => {
+          if (query.includes('MATCH (n:Entity') && params?.name === 'Alice') {
+            return [{ n: existingAlice }];
+          }
+          return [];
+        },
+      );
+
+      await graphzep.addEpisode({ content: 'Alice was promoted to tech lead at ACME.' });
+
+      // LLM should have been called for extraction AND merge
+      const llmCalls = mockLLMClient.generateStructuredResponse.mock.calls;
+      const mergeCalls = llmCalls.filter((c: any) =>
+        c.arguments[0].includes('maintaining a knowledge graph'),
+      );
+      assert(mergeCalls.length > 0, 'Should call LLM to merge entity summaries');
+
+      // Embedder should have been called for the merged summary (at least twice: episode + merged entity)
+      assert(mockEmbedder.embed.mock.calls.length >= 2);
+    });
+
+    it('should accumulate episodes on existing relation', async () => {
+      const existingEdge = {
+        uuid: 'edge-uuid',
+        groupId: 'test-group',
+        sourceNodeUuid: 'alice-uuid',
+        targetNodeUuid: 'bob-uuid',
+        name: 'KNOWS',
+        factIds: [],
+        episodes: ['old-episode-uuid'],
+        validAt: new Date(Date.now() - 10000),
+        createdAt: new Date(),
+      };
+
+      (mockDriver.executeQuery as any).mock.mockImplementation(
+        async (query: string, params: any) => {
+          if (
+            query.includes('MATCH (s:Entity') &&
+            params?.relationName === 'KNOWS'
+          ) {
+            return [{ r: existingEdge }];
+          }
+          return [];
+        },
+      );
+
+      await graphzep.addEpisode({ content: 'Alice and Bob met again at the office.' });
+
+      // Should have saved the edge with updated episodes (MERGE query)
+      const saveCalls = (mockDriver.executeQuery as any).mock.calls.filter((c: any) =>
+        c.arguments[0].includes('MERGE') && c.arguments[0].includes('RELATES_TO'),
+      );
+      assert(saveCalls.length > 0, 'Should save updated edge with new episode');
+    });
   });
 
   describe('search', () => {
@@ -180,6 +346,64 @@ describe('Graphzep Core', () => {
         query: 'Test search',
         groupId: customGroupId,
       });
+    });
+
+    it('should expand results via graph when graphExpand is true', async () => {
+      const alice = {
+        uuid: 'alice-uuid',
+        name: 'Alice',
+        entityType: 'Person',
+        summary: 'A person named Alice',
+        groupId: 'test-group',
+        createdAt: new Date(),
+        embedding: new Array(384).fill(0.1),
+      };
+      const bob = {
+        uuid: 'bob-uuid',
+        name: 'Bob',
+        entityType: 'Person',
+        summary: 'A person named Bob',
+        groupId: 'test-group',
+        createdAt: new Date(),
+      };
+
+      (mockDriver.executeQuery as any).mock.mockImplementation(async (query: string) => {
+        if (query.includes('similarity')) return [{ n: alice, labels: ['Entity'] }];
+        if (query.includes('RELATES_TO*1..1')) return [{ n: bob, nodeLabels: ['Entity'] }];
+        return [];
+      });
+
+      const results = await graphzep.search({
+        query: 'Find Alice',
+        graphExpand: true,
+        expandHops: 1,
+      });
+
+      assert.strictEqual(results.length, 2);
+      const names = results.map(r => r.name);
+      assert(names.includes('Alice'));
+      assert(names.includes('Bob'));
+    });
+
+    it('should return only seed nodes when graphExpand is false (default)', async () => {
+      const alice = {
+        uuid: 'alice-uuid',
+        name: 'Alice',
+        entityType: 'Person',
+        summary: '',
+        groupId: 'test-group',
+        createdAt: new Date(),
+        embedding: new Array(384).fill(0.1),
+      };
+
+      (mockDriver.executeQuery as any).mock.mockImplementation(async (query: string) => {
+        if (query.includes('similarity')) return [{ n: alice, labels: ['Entity'] }];
+        return [];
+      });
+
+      const results = await graphzep.search({ query: 'Find Alice' });
+      assert.strictEqual(results.length, 1);
+      assert.strictEqual(results[0].name, 'Alice');
     });
   });
 
@@ -293,6 +517,71 @@ describe('Graphzep Core', () => {
         call.arguments[0].includes('DELETE'),
       );
       assert(deleteCalls.length > 0);
+    });
+  });
+
+  describe('traverse', () => {
+    it('should return start node and neighbors', async () => {
+      const alice = {
+        uuid: 'alice-uuid',
+        name: 'Alice',
+        entityType: 'Person',
+        summary: '',
+        groupId: 'test-group',
+        labels: ['Entity'],
+        createdAt: new Date(),
+      };
+      const bob = {
+        uuid: 'bob-uuid',
+        name: 'Bob',
+        entityType: 'Person',
+        summary: '',
+        groupId: 'test-group',
+        labels: ['Entity'],
+        createdAt: new Date(),
+      };
+      const edge = {
+        uuid: 'edge-uuid',
+        groupId: 'test-group',
+        sourceNodeUuid: 'alice-uuid',
+        targetNodeUuid: 'bob-uuid',
+        name: 'KNOWS',
+        factIds: [],
+        episodes: [],
+        validAt: new Date(),
+        createdAt: new Date(),
+      };
+
+      (mockDriver.executeQuery as any).mock.mockImplementation(async (query: string, params: any) => {
+        if (query.includes('LIMIT 1') && params?.id === 'Alice') return [{ n: alice, labels: ['Entity'] }];
+        if (query.includes('RELATES_TO*1..')) return [{ n: bob, nodeLabels: ['Entity'] }];
+        if (query.includes('a.uuid IN')) return [{ e: edge }];
+        return [];
+      });
+
+      const result = await graphzep.traverse({ startEntityName: 'Alice', maxHops: 1 });
+      assert(result.start instanceof EntityNodeImpl);
+      assert.strictEqual(result.start.name, 'Alice');
+      assert.strictEqual(result.nodes.length, 1);
+      assert.strictEqual(result.nodes[0].name, 'Bob');
+      assert.strictEqual(result.edges.length, 1);
+      assert.strictEqual(result.edges[0].name, 'KNOWS');
+    });
+
+    it('should return null start when entity not found', async () => {
+      (mockDriver.executeQuery as any).mock.mockImplementation(async () => []);
+
+      const result = await graphzep.traverse({ startEntityName: 'Ghost' });
+      assert.strictEqual(result.start, null);
+      assert.strictEqual(result.nodes.length, 0);
+      assert.strictEqual(result.edges.length, 0);
+    });
+
+    it('should throw when no start identifier provided', async () => {
+      await assert.rejects(
+        () => graphzep.traverse({}),
+        /startEntityName or startEntityUuid/,
+      );
     });
   });
 

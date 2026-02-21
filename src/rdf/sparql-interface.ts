@@ -159,61 +159,22 @@ export class ZepSPARQLInterface {
   }
   
   /**
-   * Find related entities using graph traversal
+   * Find related entities using real BFS over the in-memory triple store.
+   * minConfidence is accepted for API compatibility but not applied during
+   * graph traversal (confidence lives on memory nodes, not on edges).
    */
-  async findRelatedEntities(entityName: string, maxHops = 2, minConfidence = 0.5): Promise<any[]> {
-    const query = `
-      SELECT DISTINCT ?relatedEntity ?relationPath ?totalConfidence
-      WHERE {
-        {
-          # Direct relations (1 hop)
-          ?fact1 a zep:SemanticMemory ;
-                 zep:hasStatement ?stmt1 ;
-                 zep:confidence ?conf1 .
-          
-          ?stmt1 rdf:subject ?entity1 ;
-                 rdf:predicate ?pred1 ;
-                 rdf:object ?relatedEntity .
-          
-          FILTER(CONTAINS(LCASE(STR(?entity1)), LCASE("${entityName}")))
-          FILTER(?conf1 >= ${minConfidence})
-          
-          BIND(?pred1 AS ?relationPath)
-          BIND(?conf1 AS ?totalConfidence)
-        }
-        ${maxHops >= 2 ? `
-        UNION {
-          # Indirect relations (2 hops)
-          ?fact1 a zep:SemanticMemory ;
-                 zep:hasStatement ?stmt1 ;
-                 zep:confidence ?conf1 .
-          
-          ?fact2 a zep:SemanticMemory ;
-                 zep:hasStatement ?stmt2 ;
-                 zep:confidence ?conf2 .
-          
-          ?stmt1 rdf:subject ?entity1 ;
-                 rdf:predicate ?pred1 ;
-                 rdf:object ?intermediate .
-          
-          ?stmt2 rdf:subject ?intermediate ;
-                 rdf:predicate ?pred2 ;
-                 rdf:object ?relatedEntity .
-          
-          FILTER(CONTAINS(LCASE(STR(?entity1)), LCASE("${entityName}")))
-          FILTER(?conf1 >= ${minConfidence} && ?conf2 >= ${minConfidence})
-          FILTER(?entity1 != ?relatedEntity)
-          
-          BIND(CONCAT(STR(?pred1), " -> ", STR(?pred2)) AS ?relationPath)
-          BIND((?conf1 * ?conf2) AS ?totalConfidence)
-        }
-        ` : ''}
-      }
-      ORDER BY DESC(?totalConfidence)
-    `;
-    
-    const result = await this.query(query);
-    return result.bindings;
+  async findRelatedEntities(entityName: string, maxHops = 2, _minConfidence = 0.5): Promise<any[]> {
+    const bfsResult = this.driver.traverseEntities(entityName, maxHops, 'both');
+    if (!bfsResult.startSubject) return [];
+
+    return Array.from(bfsResult.visitedSubjects).map(subject => ({
+      relatedEntity: subject,
+      relationPath: bfsResult.edges
+        .filter(e => e.sourceSubject === subject || e.targetSubject === subject)
+        .map(e => e.name)
+        .join(' | '),
+      totalConfidence: 1.0,
+    }));
   }
   
   /**

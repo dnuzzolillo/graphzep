@@ -195,8 +195,8 @@ export class EpisodicNodeImpl extends Node implements EpisodicNode {
       groupId: this.groupId,
       createdAt: this.createdAt.toISOString(),
       validAt: this.validAt.toISOString(),
-      invalidAt: this.invalidAt?.toISOString(),
-      referenceId: this.referenceId,
+      invalidAt: this.invalidAt?.toISOString() ?? null,
+      referenceId: this.referenceId ?? null,
     };
 
     const query = `

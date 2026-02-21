@@ -130,8 +130,8 @@ export class EntityEdgeImpl extends Edge implements EntityEdge {
       groupId: this.groupId,
       createdAt: this.createdAt.toISOString(),
       validAt: this.validAt.toISOString(),
-      invalidAt: this.invalidAt?.toISOString(),
-      expiredAt: this.expiredAt?.toISOString(),
+      invalidAt: this.invalidAt?.toISOString() ?? null,
+      expiredAt: this.expiredAt?.toISOString() ?? null,
     };
 
     const query = `

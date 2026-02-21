@@ -23,11 +23,8 @@ export class Neo4jDriver extends BaseGraphDriver {
       const processedParams = params
         ? Object.entries(params).reduce(
             (acc, [key, value]) => {
-              // Convert 'limit' and other integer-like parameters to integers
-              if (
-                (key === 'limit' || key === 'skip' || key === 'offset') &&
-                typeof value === 'number'
-              ) {
+              // Convert any whole-number param to neo4j integer to avoid float LIMIT errors
+              if (typeof value === 'number' && Number.isFinite(value)) {
                 acc[key] = neo4j.int(Math.floor(value));
               } else {
                 acc[key] = value;

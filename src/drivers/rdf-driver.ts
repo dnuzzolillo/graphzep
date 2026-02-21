@@ -374,9 +374,114 @@ export class OptimizedRDFDriver extends BaseGraphDriver {
    */
   async addTriples(triples: RDFTriple[]): Promise<void> {
     this.triples.push(...triples);
-    
+
     // Invalidate relevant cache entries
     this.invalidateQueryCache(triples);
+  }
+
+  /**
+   * Public accessor for the raw triple store (used by traverse() in Graphzep)
+   */
+  getTriples(): RDFTriple[] {
+    return this.triples;
+  }
+
+  /**
+   * BFS-based graph traversal over the in-memory triple store.
+   * Returns the start subject URI, all reachable subject URIs, and the
+   * edges (subject→object via predicate) that connect them.
+   */
+  public traverseEntities(
+    startName: string,
+    maxHops: number,
+    direction: 'outgoing' | 'incoming' | 'both',
+    _groupId?: string,
+  ): {
+    startSubject: string | null;
+    visitedSubjects: Set<string>;
+    edges: Array<{ sourceSubject: string; targetSubject: string; predicate: string; name: string }>;
+  } {
+    // 1. Locate subject URI by name
+    const namePredicates = ['zep:name', 'http://graphzep.ai/ontology#name'];
+    let startSubject: string | null = null;
+    for (const triple of this.triples) {
+      if (!namePredicates.includes(triple.predicate)) continue;
+      const nameVal = typeof triple.object === 'string' ? triple.object : triple.object.value;
+      if (nameVal.toLowerCase() === startName.toLowerCase()) {
+        startSubject = triple.subject;
+        break;
+      }
+    }
+    if (!startSubject) return { startSubject: null, visitedSubjects: new Set(), edges: [] };
+
+    // 2. Predicates that point to literals / metadata — skip them during traversal
+    const SKIP_PREDICATES = new Set([
+      'rdf:type', 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type',
+      'zep:name', 'http://graphzep.ai/ontology#name',
+      'zep:content', 'zep:uuid', 'zep:createdAt', 'zep:confidence',
+      'zep:sessionId', 'zep:validFrom', 'zep:validUntil', 'zep:hasEmbedding',
+      'zep:hasStatement', 'zep:derivedFrom', 'zep:accessCount',
+      'zep:entityType', 'zep:summary', 'rdfs:label', 'rdfs:comment',
+    ]);
+
+    // 3. Build adjacency index (only triples where object is a URI string)
+    const outEdges = new Map<string, Array<{ target: string; predicate: string }>>();
+    const inEdges  = new Map<string, Array<{ source: string; predicate: string }>>();
+    for (const triple of this.triples) {
+      if (SKIP_PREDICATES.has(triple.predicate)) continue;
+      if (typeof triple.object !== 'string') continue; // literals → skip
+      const src = triple.subject;
+      const tgt = triple.object;
+      if (!outEdges.has(src)) outEdges.set(src, []);
+      outEdges.get(src)!.push({ target: tgt, predicate: triple.predicate });
+      if (!inEdges.has(tgt)) inEdges.set(tgt, []);
+      inEdges.get(tgt)!.push({ source: src, predicate: triple.predicate });
+    }
+
+    // 4. BFS
+    const visited = new Set<string>([startSubject]);
+    const queue: Array<{ subject: string; hop: number }> = [{ subject: startSubject, hop: 0 }];
+    const collectedEdges: Array<{
+      sourceSubject: string;
+      targetSubject: string;
+      predicate: string;
+      name: string;
+    }> = [];
+    const seenEdgeKeys = new Set<string>();
+
+    while (queue.length > 0) {
+      const { subject, hop } = queue.shift()!;
+      if (hop >= maxHops) continue;
+
+      const neighbors: Array<{ neighbor: string; source: string; target: string; predicate: string }> = [];
+      if (direction === 'outgoing' || direction === 'both')
+        for (const { target, predicate } of outEdges.get(subject) ?? [])
+          neighbors.push({ neighbor: target, source: subject, target, predicate });
+      if (direction === 'incoming' || direction === 'both')
+        for (const { source, predicate } of inEdges.get(subject) ?? [])
+          neighbors.push({ neighbor: source, source, target: subject, predicate });
+
+      for (const { neighbor, source, target, predicate } of neighbors) {
+        const key = `${source}|${predicate}|${target}`;
+        if (!seenEdgeKeys.has(key)) {
+          seenEdgeKeys.add(key);
+          const name = predicate.includes('#')
+            ? predicate.split('#').pop()!
+            : predicate.includes('/')
+              ? predicate.split('/').pop()!
+              : predicate;
+          collectedEdges.push({ sourceSubject: source, targetSubject: target, predicate, name });
+        }
+        if (!visited.has(neighbor)) {
+          visited.add(neighbor);
+          queue.push({ subject: neighbor, hop: hop + 1 });
+        }
+      }
+    }
+
+    const visitedExcludingStart = new Set(visited);
+    visitedExcludingStart.delete(startSubject);
+    return { startSubject, visitedSubjects: visitedExcludingStart, edges: collectedEdges };
   }
   
   /**
