@@ -9,6 +9,7 @@
     "memory-demo": "tsx quickstart/memory-demo.ts",
     "stress-test": "tsx quickstart/stress-test.ts",
     "story-qa": "tsx quickstart/story-qa.ts",
+    "sleep-test": "tsx quickstart/sleep-test.ts",
     "quickstart:neo4j": "tsx quickstart/quickstart-neo4j.ts",
     "quickstart:falkordb": "tsx quickstart/quickstart-falkordb.ts",
     "quickstart:rdf": "tsx quickstart/quickstart-rdf.ts",
