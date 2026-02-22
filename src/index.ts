@@ -26,3 +26,6 @@ export * from './rdf/namespaces.js';
 export * from './rdf/memory-mapper.js';
 export * from './rdf/ontology-manager.js';
 export * from './rdf/sparql-interface.js';
+
+// Sleep Engine exports
+export * from './sleep/index.js';
