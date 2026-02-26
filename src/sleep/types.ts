@@ -2,6 +2,19 @@ import type { BaseLLMClient } from '../llm/client.js';
 import type { BaseEmbedderClient } from '../embedders/client.js';
 import type { GraphDriver } from '../types/index.js';
 
+// ── Tiered memory config ───────────────────────────────────────────────────────
+
+/**
+ * Pass this instead of a plain groupId string to run the sleep cycle in
+ * tiered mode: episodes are read from `stmGroupId` (short-term memory) and
+ * consolidated entities / relations are written to `ltmGroupId` (long-term
+ * memory).  Pruning runs on `ltmGroupId` only.
+ */
+export interface TierConfig {
+  stmGroupId: string;
+  ltmGroupId: string;
+}
+
 // ── Engine config ─────────────────────────────────────────────────────────────
 
 export interface SleepEngineConfig {
@@ -91,7 +104,10 @@ export interface PruningReport {
 // ── Final report ──────────────────────────────────────────────────────────────
 
 export interface SleepReport {
+  /** STM groupId (or the single groupId in legacy mode) */
   groupId: string;
+  /** LTM groupId — defined only when running in tiered mode */
+  ltmGroupId?: string;
   dryRun: boolean;
   startedAt: Date;
   completedAt: Date;

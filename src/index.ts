@@ -7,7 +7,6 @@ export * from './core/edges.js';
 export * from './drivers/driver.js';
 export * from './drivers/neo4j.js';
 export * from './drivers/falkordb.js';
-export * from './drivers/rdf-driver.js';
 
 export * from './llm/client.js';
 export * from './llm/openai.js';
@@ -17,15 +16,6 @@ export * from './embedders/client.js';
 export * from './embedders/openai.js';
 
 export * from './utils/datetime.js';
-
-// Zep Memory System exports
-export * from './zep/index.js';
-
-// RDF System exports
-export * from './rdf/namespaces.js';
-export * from './rdf/memory-mapper.js';
-export * from './rdf/ontology-manager.js';
-export * from './rdf/sparql-interface.js';
 
 // Sleep Engine exports
 export * from './sleep/index.js';

@@ -1,26 +1,14 @@
 import { z } from 'zod';
 import {
   GraphDriver,
-  EntityNode,
   EpisodicNode,
-  CommunityNode,
-  EntityEdge,
-  EpisodicEdge,
-  CommunityEdge,
   EpisodeType,
-  GraphProvider,
 } from './types/index.js';
 import { Node, EntityNodeImpl, EpisodicNodeImpl, CommunityNodeImpl } from './core/nodes.js';
 import { Edge, EntityEdgeImpl, EpisodicEdgeImpl, CommunityEdgeImpl } from './core/edges.js';
 import { BaseLLMClient } from './llm/client.js';
 import { BaseEmbedderClient } from './embedders/client.js';
 import { utcNow } from './utils/datetime.js';
-import { OptimizedRDFDriver } from './drivers/rdf-driver.js';
-import { RDFMemoryMapper } from './rdf/memory-mapper.js';
-import { OntologyManager } from './rdf/ontology-manager.js';
-import { ZepSPARQLInterface } from './rdf/sparql-interface.js';
-import { NamespaceManager } from './rdf/namespaces.js';
-import { ZepMemory, ZepFact, MemoryType, ZepSearchParams, ZepSearchResult } from './zep/types.js';
 
 export interface GraphzepConfig {
   driver: GraphDriver;
@@ -28,12 +16,6 @@ export interface GraphzepConfig {
   embedder: BaseEmbedderClient;
   groupId?: string;
   ensureAscii?: boolean;
-  // RDF-specific options
-  customOntologyPath?: string;
-  rdfConfig?: {
-    includeEmbeddings?: boolean;
-    embeddingSchema?: 'base64' | 'vector-ref' | 'compressed';
-  };
 }
 
 export interface AddEpisodeParams {
@@ -135,12 +117,6 @@ export class Graphzep {
   private embedder: BaseEmbedderClient;
   private defaultGroupId: string;
   private ensureAscii: boolean;
-  
-  // RDF-specific components
-  private rdfMapper?: RDFMemoryMapper;
-  private ontologyManager?: OntologyManager;
-  private sparqlInterface?: ZepSPARQLInterface;
-  private isRDFEnabled: boolean;
 
   constructor(config: GraphzepConfig) {
     this.driver = config.driver;
@@ -148,37 +124,6 @@ export class Graphzep {
     this.embedder = config.embedder;
     this.defaultGroupId = config.groupId || 'default';
     this.ensureAscii = config.ensureAscii ?? false;
-    
-    // Initialize RDF components if using RDF driver
-    this.isRDFEnabled = this.driver.provider === GraphProvider.RDF;
-    
-    if (this.isRDFEnabled && this.driver instanceof OptimizedRDFDriver) {
-      this.initializeRDFComponents(config);
-    }
-  }
-  
-  private async initializeRDFComponents(config: GraphzepConfig): Promise<void> {
-    if (!(this.driver instanceof OptimizedRDFDriver)) return;
-    
-    const nsManager = new NamespaceManager();
-    
-    // Initialize RDF memory mapper
-    this.rdfMapper = new RDFMemoryMapper({
-      namespaceManager: nsManager,
-      includeEmbeddings: config.rdfConfig?.includeEmbeddings ?? true,
-      embeddingSchema: config.rdfConfig?.embeddingSchema ?? 'vector-ref'
-    });
-    
-    // Initialize ontology manager
-    this.ontologyManager = new OntologyManager(nsManager);
-    
-    // Load custom ontology if provided
-    if (config.customOntologyPath) {
-      await this.ontologyManager.loadOntology(config.customOntologyPath);
-    }
-    
-    // Initialize SPARQL interface
-    this.sparqlInterface = new ZepSPARQLInterface(this.driver, nsManager);
   }
 
   async addEpisode(params: AddEpisodeParams): Promise<EpisodicNode> {
@@ -201,41 +146,9 @@ export class Graphzep {
       createdAt: utcNow(),
     });
 
-    // Handle RDF storage if enabled
-    if (this.isRDFEnabled && this.rdfMapper && this.driver instanceof OptimizedRDFDriver) {
-      const zepMemory: ZepMemory = {
-        uuid: episodicNode.uuid || '',
-        sessionId: groupId,
-        content: params.content,
-        memoryType: MemoryType.EPISODIC,
-        embedding,
-        metadata: params.metadata,
-        createdAt: utcNow(),
-        accessCount: 0,
-        validFrom: utcNow(),
-        facts: []
-      };
-
-      // Convert to RDF and store
-      const triples = this.rdfMapper.episodicToRDF(zepMemory);
-      
-      // Validate against ontology if available
-      if (this.ontologyManager) {
-        const validation = this.ontologyManager.validateTriples(triples);
-        if (!validation.valid) {
-          console.warn('RDF validation warnings:', validation.warnings);
-          console.error('RDF validation errors:', validation.errors);
-        }
-      }
-
-      await this.driver.addTriples(triples);
-      return episodicNode; // Skip traditional graph processing for RDF
-    }
-
-    // Traditional graph processing for non-RDF drivers
     await episodicNode.save(this.driver);
 
-    const existingEntities = await this.fetchExistingEntities(groupId);
+    const existingEntities = await this.fetchExistingEntities(groupId, embedding);
     const extractedData = await this.extractEntitiesAndRelations(params.content, existingEntities);
 
     const entityNodes = await this.processExtractedEntities(extractedData.entities, groupId);
@@ -249,19 +162,55 @@ export class Graphzep {
 
   private async fetchExistingEntities(
     groupId: string,
+    episodeEmbedding?: number[],
   ): Promise<Array<{ uuid: string; name: string; entityType: string }>> {
-    const result = await this.driver.executeQuery<any[]>(
+    if (!episodeEmbedding) {
+      const result = await this.driver.executeQuery<any[]>(
+        `MATCH (n:Entity {groupId: $groupId})
+         RETURN n.uuid AS uuid, n.name AS name, n.entityType AS entityType
+         ORDER BY n.createdAt DESC
+         LIMIT 20`,
+        { groupId },
+      );
+      return result
+        .map(r => ({ uuid: r.uuid ?? '', name: r.name ?? '', entityType: r.entityType ?? '' }))
+        .filter(e => e.name);
+    }
+
+    // Fetch semantic candidates from DB — wider pool to re-rank afterwards
+    const candidates = await this.driver.executeQuery<any[]>(
       `MATCH (n:Entity {groupId: $groupId})
-       RETURN n.uuid AS uuid, n.name AS name, n.entityType AS entityType
-       ORDER BY n.createdAt DESC
-       LIMIT 20`,
-      { groupId },
+       WHERE n.summaryEmbedding IS NOT NULL
+       WITH n,
+         reduce(sim = 0.0, i IN range(0, size(n.summaryEmbedding)-1) |
+           sim + (n.summaryEmbedding[i] * $embedding[i])
+         ) AS semanticScore
+       WHERE semanticScore > $threshold
+       RETURN n.uuid AS uuid, n.name AS name, n.entityType AS entityType,
+              semanticScore, n.createdAt AS createdAt
+       ORDER BY semanticScore DESC
+       LIMIT $pool`,
+      { groupId, embedding: episodeEmbedding, threshold: 0.65, pool: 50 },
     );
-    return result.map(r => ({
-      uuid: r.uuid ?? r.n?.uuid ?? '',
-      name: r.name ?? r.n?.name ?? '',
-      entityType: r.entityType ?? r.n?.entityType ?? '',
-    })).filter(e => e.name);
+
+    if (candidates.length === 0) return [];
+
+    // Re-rank: semantic relevance + recency (exponential decay, half-life ~7 days)
+    const now = Date.now();
+    const ALPHA = 0.7;   // weight for semantic score
+    const LAMBDA = 0.1;  // decay rate: score = e^(-lambda * ageDays)
+
+    return candidates
+      .map(r => {
+        const ageDays = (now - new Date(r.createdAt).getTime()) / 86_400_000;
+        const recencyScore = Math.exp(-LAMBDA * ageDays);
+        const finalScore = ALPHA * r.semanticScore + (1 - ALPHA) * recencyScore;
+        return { uuid: r.uuid ?? '', name: r.name ?? '', entityType: r.entityType ?? '', finalScore };
+      })
+      .filter(e => e.name)
+      .sort((a, b) => b.finalScore - a.finalScore)
+      .slice(0, 20)
+      .map(({ uuid, name, entityType }) => ({ uuid, name, entityType }));
   }
 
   private async extractEntitiesAndRelations(
@@ -286,10 +235,11 @@ Rules:
 2. Use the canonical full name (prefer "Alice Smith" over "Alice" or "Ms. Smith").
 3. If the text refers to a known entity listed above, reuse its exact name.
 4. entityType must be one of: ${entityTypesStr}.
-5. relationName must be UPPER_SNAKE_CASE (e.g. WORKS_AT, KNOWS, LOCATED_IN).
-6. confidence: 0.0–1.0 — how clearly stated the entity or relation is in the text.
-7. isNegated: true if the text explicitly denies the relation (e.g. "Alice does NOT work at ACME").
-8. temporalValidity: "historical" if the relation is past or explicitly ended (e.g. "used to", "formerly", "left", "was").
+5. relationName must be UPPER_SNAKE_CASE (e.g. WORKS_AT, KNOWS, LOCATED_IN, NAMED_AFTER, DEDICATED_TO, FOUNDED_BY, DESCRIBED_BY, DISCOVERED_BY, COMPETES_IN, PART_OF).
+6. CRITICAL — always extract attribution and dedication relations: if the text says "named after X", "dedicated to X", "founded by X", "described by X", "discovered by X", "honors X" — you MUST create a RELATES_TO edge for it. These are the highest-value facts in the graph and must never be omitted.
+7. confidence: 0.0–1.0 — how clearly stated the entity or relation is in the text.
+8. isNegated: true if the text explicitly denies the relation (e.g. "Alice does NOT work at ACME").
+9. temporalValidity: "historical" if the relation is past or explicitly ended (e.g. "used to", "formerly", "left", "was").
 
 Respond with valid JSON:
 {
@@ -587,43 +537,6 @@ Return JSON with the merged summary.`;
     );
     if (seedEntities.length === 0) return seedNodes;
 
-    // RDF branch: BFS for each seed entity
-    if (this.isRDFEnabled && this.driver instanceof OptimizedRDFDriver) {
-      const allNodes = new Map<string, Node>();
-      for (const node of seedNodes) allNodes.set(node.uuid, node);
-
-      const allTriples = this.driver.getTriples();
-      for (const entity of seedEntities) {
-        const bfsResult = this.driver.traverseEntities(entity.name, hops, 'both', groupId);
-        for (const subject of bfsResult.visitedSubjects) {
-          if (allNodes.has(subject)) continue;
-          const get = (pred: string): string => {
-            const t = allTriples.find(
-              tr =>
-                tr.subject === subject &&
-                (tr.predicate === pred ||
-                  tr.predicate === pred.replace('zep:', 'http://graphzep.ai/ontology#')),
-            );
-            return t ? (typeof t.object === 'string' ? t.object : t.object.value) : '';
-          };
-          allNodes.set(
-            subject,
-            new EntityNodeImpl({
-              uuid: subject,
-              name: get('zep:name') || subject.split(/[#/]/).pop() || subject,
-              groupId,
-              entityType: get('zep:entityType') || 'Unknown',
-              summary: get('zep:summary') || '',
-              labels: ['Entity'],
-              createdAt: new Date(),
-            }),
-          );
-        }
-      }
-      return [...allNodes.values()];
-    }
-
-    // Neo4j / FalkorDB branch: single batch neighbor query
     const seedUuids = seedEntities.map(e => e.uuid).filter(Boolean);
     const expandLimit = Math.floor(originalLimit * 2);
 
@@ -691,98 +604,8 @@ Return JSON with the merged summary.`;
     await this.driver.executeQuery('RETURN 1');
   }
 
-  // ========================================
-  // RDF-SPECIFIC METHODS
-  // ========================================
-
-  /**
-   * Execute SPARQL query (RDF drivers only)
-   */
-  async sparqlQuery(query: string, options?: any): Promise<any> {
-    if (!this.isRDFEnabled || !this.sparqlInterface) {
-      throw new Error('SPARQL queries require RDF driver');
-    }
-    
-    return await this.sparqlInterface.query(query, options);
-  }
-
-  /**
-   * Add semantic fact (RDF drivers only)
-   */
-  async addFact(fact: Omit<ZepFact, 'uuid'>): Promise<string> {
-    if (!this.isRDFEnabled || !this.rdfMapper || !(this.driver instanceof OptimizedRDFDriver)) {
-      throw new Error('addFact requires RDF driver');
-    }
-
-    const fullFact: ZepFact = {
-      uuid: '',
-      ...fact
-    };
-
-    const triples = this.rdfMapper.semanticToRDF(fullFact);
-    
-    // Validate against ontology if available
-    if (this.ontologyManager) {
-      const validation = this.ontologyManager.validateTriples(triples);
-      if (!validation.valid) {
-        console.warn('Fact validation warnings:', validation.warnings);
-        if (validation.errors.length > 0) {
-          throw new Error(`Fact validation failed: ${validation.errors.map(e => e.message).join(', ')}`);
-        }
-      }
-    }
-
-    await this.driver.addTriples(triples);
-    return fullFact.uuid;
-  }
-
-  /**
-   * Search memories using Zep-specific search parameters (RDF drivers)
-   */
-  async searchMemories(params: ZepSearchParams): Promise<ZepSearchResult[]> {
-    if (!this.isRDFEnabled || !this.sparqlInterface) {
-      throw new Error('searchMemories requires RDF driver');
-    }
-
-    return await this.sparqlInterface.searchMemories(params);
-  }
-
-  /**
-   * Get memories at a specific time (RDF drivers only)
-   */
-  async getMemoriesAtTime(timestamp: Date, memoryTypes?: MemoryType[]): Promise<ZepMemory[]> {
-    if (!this.isRDFEnabled || !this.sparqlInterface) {
-      throw new Error('getMemoriesAtTime requires RDF driver');
-    }
-
-    return await this.sparqlInterface.getMemoriesAtTime(timestamp, memoryTypes);
-  }
-
-  /**
-   * Get facts about an entity (RDF drivers only)
-   */
-  async getFactsAboutEntity(entityName: string, validAt?: Date): Promise<ZepFact[]> {
-    if (!this.isRDFEnabled || !this.sparqlInterface) {
-      throw new Error('getFactsAboutEntity requires RDF driver');
-    }
-
-    return await this.sparqlInterface.getFactsAboutEntity(entityName, validAt);
-  }
-
-  /**
-   * Find related entities using graph traversal (RDF drivers only)
-   */
-  async findRelatedEntities(entityName: string, maxHops = 2, minConfidence = 0.5): Promise<any[]> {
-    if (!this.isRDFEnabled || !this.sparqlInterface) {
-      throw new Error('findRelatedEntities requires RDF driver');
-    }
-
-    return await this.sparqlInterface.findRelatedEntities(entityName, maxHops, minConfidence);
-  }
-
   /**
    * Traverse the graph starting from an entity, collecting reachable nodes and edges.
-   * Works with Neo4j/FalkorDB (Cypher variable-length paths) and RDF (BFS over triples).
    */
   async traverse(params: TraverseParams): Promise<TraverseResult> {
     if (!params.startEntityName && !params.startEntityUuid) {
@@ -794,187 +617,7 @@ Return JSON with the merged summary.`;
     const limit     = params.limit     ?? 50;
     const groupId   = params.groupId   || this.defaultGroupId;
 
-    // RDF branch: BFS directly over the triple store
-    if (this.isRDFEnabled && this.driver instanceof OptimizedRDFDriver) {
-      const startName = params.startEntityName || params.startEntityUuid || '';
-      const bfsResult = this.driver.traverseEntities(startName, maxHops, direction, groupId);
-      if (!bfsResult.startSubject) return { start: null, nodes: [], edges: [] };
-
-      const allTriples = this.driver.getTriples();
-      const buildEntity = (subject: string): EntityNodeImpl => {
-        const get = (pred: string): string => {
-          const t = allTriples.find(
-            tr =>
-              tr.subject === subject &&
-              (tr.predicate === pred ||
-                tr.predicate === pred.replace('zep:', 'http://graphzep.ai/ontology#')),
-          );
-          return t ? (typeof t.object === 'string' ? t.object : t.object.value) : '';
-        };
-        return new EntityNodeImpl({
-          uuid: subject,
-          name: get('zep:name') || subject.split(/[#/]/).pop() || subject,
-          groupId,
-          entityType: get('zep:entityType') || 'Unknown',
-          summary: get('zep:summary') || '',
-          labels: ['Entity'],
-          createdAt: new Date(),
-        });
-      };
-
-      return {
-        start: buildEntity(bfsResult.startSubject),
-        nodes: Array.from(bfsResult.visitedSubjects).slice(0, limit).map(buildEntity),
-        edges: bfsResult.edges.map(
-          e =>
-            new EntityEdgeImpl({
-              uuid: `${e.sourceSubject}|${e.predicate}|${e.targetSubject}`,
-              groupId,
-              sourceNodeUuid: e.sourceSubject,
-              targetNodeUuid: e.targetSubject,
-              name: e.name,
-              factIds: [],
-              episodes: [],
-              validAt: new Date(),
-              createdAt: new Date(),
-            }),
-        ),
-      };
-    }
-
-    // Neo4j / FalkorDB branch
     return this._traverseCypher(params, maxHops, direction, limit, groupId);
-  }
-
-  /**
-   * Export current knowledge graph as RDF (works with all drivers)
-   */
-  async exportToRDF(format: 'turtle' | 'rdf-xml' | 'json-ld' | 'n-triples' = 'turtle'): Promise<string> {
-    if (this.isRDFEnabled && this.driver instanceof OptimizedRDFDriver) {
-      return await this.driver.serialize(format);
-    } else {
-      // Convert property graph to RDF
-      throw new Error('Property graph to RDF conversion not yet implemented');
-    }
-  }
-
-  /**
-   * Load custom ontology (RDF drivers only)
-   */
-  async loadOntology(ontologyPath: string): Promise<string> {
-    if (!this.isRDFEnabled || !this.ontologyManager) {
-      throw new Error('loadOntology requires RDF driver');
-    }
-
-    return await this.ontologyManager.loadOntology(ontologyPath);
-  }
-
-  /**
-   * Generate extraction guidance for LLM using ontology
-   */
-  async generateExtractionGuidance(content: string): Promise<string> {
-    if (!this.isRDFEnabled || !this.ontologyManager) {
-      // Fallback to traditional extraction for non-RDF drivers
-      return this.generateTraditionalExtractionPrompt(content);
-    }
-
-    const guidance = this.ontologyManager.generateExtractionGuidance(content);
-    return guidance.prompt;
-  }
-
-  /**
-   * Get ontology statistics (RDF drivers only)
-   */
-  getOntologyStats(): any {
-    if (!this.isRDFEnabled || !this.ontologyManager) {
-      throw new Error('getOntologyStats requires RDF driver');
-    }
-
-    return this.ontologyManager.getOntologyStats();
-  }
-
-  /**
-   * Check if RDF support is enabled
-   */
-  isRDFSupported(): boolean {
-    return this.isRDFEnabled;
-  }
-
-  /**
-   * Get available SPARQL query templates
-   */
-  getSPARQLTemplates(): Record<string, string> {
-    return {
-      allMemories: `
-        SELECT ?memory ?type ?content ?confidence ?sessionId ?createdAt
-        WHERE {
-          ?memory a ?type ;
-                  zep:content ?content ;
-                  zep:confidence ?confidence ;
-                  zep:sessionId ?sessionId ;
-                  zep:createdAt ?createdAt .
-          
-          FILTER(?type IN (zep:EpisodicMemory, zep:SemanticMemory, zep:ProceduralMemory))
-        }
-        ORDER BY DESC(?createdAt)
-      `,
-      
-      memoryBySession: `
-        SELECT ?memory ?type ?content ?confidence ?createdAt
-        WHERE {
-          ?memory a ?type ;
-                  zep:content ?content ;
-                  zep:confidence ?confidence ;
-                  zep:sessionId ?SESSION_ID ;
-                  zep:createdAt ?createdAt .
-        }
-        ORDER BY ?createdAt
-      `,
-      
-      highConfidenceFacts: `
-        SELECT ?fact ?subject ?predicate ?object ?confidence ?validFrom
-        WHERE {
-          ?fact a zep:SemanticMemory ;
-                zep:hasStatement ?statement ;
-                zep:confidence ?confidence ;
-                zep:validFrom ?validFrom .
-          
-          ?statement rdf:subject ?subject ;
-                     rdf:predicate ?predicate ;
-                     rdf:object ?object .
-          
-          FILTER(?confidence >= 0.8)
-        }
-        ORDER BY DESC(?confidence)
-      `,
-      
-      entitiesByType: `
-        SELECT ?entity ?name ?type ?summary
-        WHERE {
-          ?entity a zep:Entity ;
-                  zep:name ?name ;
-                  zep:entityType ?type ;
-                  zep:summary ?summary .
-          
-          FILTER(?type = "?ENTITY_TYPE")
-        }
-      `,
-      
-      memoryEvolution: `
-        SELECT (STRFTIME("%Y-%m", ?createdAt) AS ?month)
-               (COUNT(?memory) AS ?memoryCount)
-               (AVG(?confidence) AS ?avgConfidence)
-        WHERE {
-          ?memory a ?type ;
-                  zep:confidence ?confidence ;
-                  zep:createdAt ?createdAt .
-          
-          FILTER(?type IN (zep:EpisodicMemory, zep:SemanticMemory))
-        }
-        GROUP BY ?month
-        ORDER BY ?month
-      `
-    };
   }
 
   private async _traverseCypher(
@@ -1071,40 +714,4 @@ Return JSON with the merged summary.`;
     return { start: startNode, nodes: [...nodeMap.values()], edges: [...edgeMap.values()] };
   }
 
-  private generateTraditionalExtractionPrompt(content: string): string {
-    return `
-Extract entities and their relationships from the following text.
-
-Text: ${content}
-
-Instructions:
-1. Identify all entities (people, places, organizations, concepts, etc.)
-2. For each entity, provide:
-   - name: The entity's name
-   - entityType: The type/category of the entity
-   - summary: A brief description of the entity based on the context
-3. Identify relationships between entities
-4. For each relationship, provide:
-   - sourceName: The name of the source entity
-   - targetName: The name of the target entity
-   - relationName: The nature/type of the relationship
-
-Respond with valid JSON matching this structure:
-{
-  "entities": [
-    {
-      "name": "string",
-      "entityType": "string", 
-      "summary": "string"
-    }
-  ],
-  "relations": [
-    {
-      "sourceName": "string",
-      "targetName": "string",
-      "relationName": "string"
-    }
-  ]
-}`;
-  }
 }

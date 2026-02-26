@@ -3,6 +3,7 @@ export type {
   SleepEngineConfig,
   SleepOptions,
   SleepReport,
+  TierConfig,
   ConsolidationReport,
   PruningReport,
   MergedPair,

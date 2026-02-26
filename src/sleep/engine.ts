@@ -35,7 +35,7 @@
 
 import { Consolidator } from './consolidator.js';
 import { Pruner } from './pruner.js';
-import type { SleepEngineConfig, SleepOptions, SleepReport } from './types.js';
+import type { SleepEngineConfig, SleepOptions, SleepReport, TierConfig } from './types.js';
 
 export class SleepEngine {
   private readonly consolidator: Consolidator;
@@ -47,36 +47,46 @@ export class SleepEngine {
   }
 
   /**
-   * Run a full sleep cycle for the given groupId.
+   * Run a full sleep cycle.
    *
-   * @param groupId  The workspace/session to process (same groupId used with addEpisode)
-   * @param options  Fine-grained control over each phase; safe defaults apply if omitted
-   * @returns        A detailed report of every change made (or that would be made in dryRun mode)
+   * @param target   Either a plain `groupId` string (legacy mode — consolidates
+   *                 within a single graph) or a `TierConfig` object with
+   *                 `{ stmGroupId, ltmGroupId }` (tiered mode — reads from STM,
+   *                 writes consolidated entities and relations to LTM, and runs
+   *                 pruning on LTM only).
+   * @param options  Fine-grained control over each phase; safe defaults apply if omitted.
+   * @returns        A detailed report of every change made (or that would be made in dryRun mode).
    *
-   * @example
-   * const engine = new SleepEngine({ driver, llm, embedder });
-   *
-   * // Preview without writing
-   * const preview = await engine.sleep('my-group', { dryRun: true });
-   * console.log(preview);
-   *
-   * // Full cycle
+   * @example — legacy mode (single graph)
    * const report = await engine.sleep('my-group');
+   *
+   * @example — tiered mode (STM → LTM)
+   * const report = await engine.sleep({
+   *   stmGroupId: 'stm-alice',
+   *   ltmGroupId: 'ltm-alice',
+   * });
    */
-  async sleep(groupId: string, options: SleepOptions = {}): Promise<SleepReport> {
-    const startedAt = new Date();
-    const dryRun = options.dryRun ?? false;
+  async sleep(target: string | TierConfig, options: SleepOptions = {}): Promise<SleepReport> {
+    const startedAt  = new Date();
+    const dryRun     = options.dryRun ?? false;
+    const isTiered   = typeof target !== 'string';
+    const groupId    = isTiered ? target.stmGroupId : target;
+    const ltmGroupId = isTiered ? target.ltmGroupId : undefined;
 
     // ── Phase 1 — Consolidation ───────────────────────────────────────────────
     const phase1Enabled = options.consolidation?.enabled !== false;
     const phase1 = phase1Enabled
-      ? await this.consolidator.run(groupId, options)
+      ? isTiered
+        ? await this.consolidator.runTiered(target.stmGroupId, target.ltmGroupId, options)
+        : await this.consolidator.run(groupId, options)
       : emptyConsolidationReport();
 
     // ── Phase 2 — Pruning & entity resolution ─────────────────────────────────
+    // In tiered mode: prune only the LTM graph (STM entities are ephemeral).
     const phase2Enabled = options.pruning?.enabled !== false;
+    const pruningTarget = isTiered ? target.ltmGroupId : groupId;
     const phase2 = phase2Enabled
-      ? await this.pruner.run(groupId, options)
+      ? await this.pruner.run(pruningTarget, options)
       : emptyPruningReport();
 
     // ── Phase 3 — Association (REM) ───────────────────────────────────────────
@@ -119,6 +129,7 @@ export class SleepEngine {
 
     return {
       groupId,
+      ltmGroupId,
       dryRun,
       startedAt,
       completedAt,
