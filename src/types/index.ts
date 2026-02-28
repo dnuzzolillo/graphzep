@@ -71,6 +71,10 @@ export interface EpisodicNode extends BaseNode {
   invalidAt?: Date;
   createdAt: Date;
   referenceId?: string;
+  /** Days between validAt (when event occurred) and createdAt (ingestion time). 0 = contemporaneous. */
+  retroactiveDays?: number;
+  /** UUIDs of episodes that contradict this episode. */
+  disputedBy?: string[];
 }
 
 export interface CommunityNode extends BaseNode {
@@ -97,6 +101,8 @@ export interface EntityEdge extends BaseEdge {
   expiredAt?: Date;
   validAt: Date;
   invalidAt?: Date;
+  /** UUIDs of episodes that dispute this relation. */
+  disputedBy?: string[];
 }
 
 export interface EpisodicEdge extends BaseEdge {}

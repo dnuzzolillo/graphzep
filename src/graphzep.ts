@@ -23,6 +23,13 @@ export interface AddEpisodeParams {
   episodeType?: EpisodeType;
   referenceId?: string;
   groupId?: string;
+  /**
+   * When the event actually happened.
+   * Defaults to the ingestion time (utcNow()) if not provided.
+   * Use this to back-date episodes: e.g. an email sent on Feb 11 should
+   * have validAt = new Date('2026-02-11').
+   */
+  validAt?: Date;
   metadata?: Record<string, any>;
 }
 
@@ -34,6 +41,31 @@ export interface SearchParams {
   nodeTypes?: ('entity' | 'episodic' | 'community')[];
   graphExpand?: boolean; // expand results by traversing edges from seed entities
   expandHops?: number;   // hops for expansion (default 1)
+  /**
+   * Only return Episodic nodes whose `validAt` is on or after this date.
+   * Entity and Community nodes are unaffected by this filter.
+   */
+  validFrom?: Date;
+  /**
+   * Only return Episodic nodes whose `validAt` is on or before this date.
+   * Entity and Community nodes are unaffected by this filter.
+   */
+  validTo?: Date;
+  /**
+   * Reference time used for temporal scoring. When provided, Episodic nodes
+   * whose validAt is close to this time receive a higher score.
+   */
+  queryTime?: Date;
+  /**
+   * Weight of the temporal proximity bonus (0–1). Default 0.3.
+   * Set to 0 to disable temporal weighting.
+   */
+  temporalAlpha?: number;
+  /**
+   * Half-life in days for temporal proximity decay. Default 30.
+   * Smaller values emphasise very recent events more strongly.
+   */
+  halfLifeDays?: number;
 }
 
 export interface TraverseParams {
@@ -132,6 +164,15 @@ export class Graphzep {
 
     const embedding = await this.embedder.embed(params.content);
 
+    const createdAt = utcNow();
+    const validAt = params.validAt ?? createdAt;
+    // retroactiveDays: how many days before ingestion did the event occur?
+    // 0 = contemporaneous recording; positive = back-dated episode.
+    const retroactiveDays = Math.max(
+      0,
+      Math.round((createdAt.getTime() - validAt.getTime()) / 86_400_000),
+    );
+
     // Create episodic node
     const episodicNode = new EpisodicNodeImpl({
       uuid: '',
@@ -140,10 +181,12 @@ export class Graphzep {
       episodeType,
       content: params.content,
       embedding,
-      validAt: utcNow(),
+      validAt,
       referenceId: params.referenceId,
       labels: [],
-      createdAt: utcNow(),
+      createdAt,
+      retroactiveDays,
+      disputedBy: [],
     });
 
     await episodicNode.save(this.driver);
@@ -396,8 +439,22 @@ Return JSON with the merged summary.`;
     for (const relation of relations) {
       // Skip low-confidence relations
       if ((relation.confidence ?? 1.0) < RELATION_CONFIDENCE_THRESHOLD) continue;
-      // Skip negated relations — "Alice does NOT work at ACME" should not create an edge
-      if (relation.isNegated ?? false) continue;
+
+      // Negated relations: detect conflict, mark both sides, but don't create an edge
+      if (relation.isNegated ?? false) {
+        const source = entityMap.get(relation.sourceName);
+        const target = entityMap.get(relation.targetName);
+        if (source && target) {
+          await this._resolveConflict(
+            source,
+            target,
+            relation.relationName,
+            episodeUuid,
+            groupId,
+          );
+        }
+        continue;
+      }
 
       const source = entityMap.get(relation.sourceName);
       const target = entityMap.get(relation.targetName);
@@ -446,6 +503,69 @@ Return JSON with the merged summary.`;
     }
   }
 
+  /**
+   * When a negated relation is extracted, find the positive counterpart in the
+   * graph and cross-mark both the edge and the new episode as disputed.
+   *
+   * Returns true if a conflict was detected and marked.
+   */
+  private async _resolveConflict(
+    source: EntityNodeImpl,
+    target: EntityNodeImpl,
+    relationName: string,
+    newEpisodeUuid: string,
+    groupId: string,
+  ): Promise<boolean> {
+    // Find active positive edge between the same pair
+    const result = await this.driver.executeQuery<any[]>(
+      `
+      MATCH (src:Entity {uuid: $sourceUuid, groupId: $groupId})
+            -[e:RELATES_TO {name: $relationName}]->
+            (tgt:Entity {uuid: $targetUuid, groupId: $groupId})
+      WHERE e.invalidAt IS NULL
+      RETURN e
+      LIMIT 1
+      `,
+      { sourceUuid: source.uuid, targetUuid: target.uuid, relationName, groupId },
+    );
+
+    if (result.length === 0) return false;
+
+    const raw = result[0].e;
+    const props = (raw?.properties ?? raw) as Record<string, any>;
+    const edgeUuid: string = props.uuid ?? '';
+    const supportingEpisodes: string[] = props.episodes ?? [];
+
+    // Mark the edge as disputed by the new episode
+    const edgeDisputedBy: string[] = [...(props.disputedBy ?? [])];
+    if (!edgeDisputedBy.includes(newEpisodeUuid)) edgeDisputedBy.push(newEpisodeUuid);
+    await this.driver.executeQuery(
+      `MATCH ()-[e:RELATES_TO {uuid: $edgeUuid}]->()
+       SET e.disputedBy = $disputedBy`,
+      { edgeUuid, disputedBy: edgeDisputedBy },
+    );
+
+    // Mark the new episode as disputed by the episodes that support the positive relation
+    if (supportingEpisodes.length > 0) {
+      await this.driver.executeQuery(
+        `MATCH (n:Episodic {uuid: $episodeUuid})
+         SET n.disputedBy = $disputedBy`,
+        { episodeUuid: newEpisodeUuid, disputedBy: supportingEpisodes },
+      );
+    }
+
+    console.warn(
+      '[conflict] Episode %s disputes relation %s (%s → %s); edge %s marked as disputed',
+      newEpisodeUuid,
+      relationName,
+      source.name,
+      target.name,
+      edgeUuid,
+    );
+
+    return true;
+  }
+
   private async findExistingRelation(
     sourceUuid: string,
     targetUuid: string,
@@ -486,25 +606,35 @@ Return JSON with the merged summary.`;
     const groupId = params.groupId || this.defaultGroupId;
     const limit = Math.floor(params.limit || 10);
 
+    // Build optional date filter — applies only to Episodic nodes so Entity /
+    // Community results are never suppressed by temporal constraints.
+    const dateParts: string[] = [];
+    if (params.validFrom) dateParts.push('n.validAt >= datetime($validFrom)');
+    if (params.validTo)   dateParts.push('n.validAt <= datetime($validTo)');
+    const dateClause = dateParts.length > 0
+      ? `AND (NOT (n:Episodic) OR (${dateParts.join(' AND ')}))`
+      : '';
+
     const query = `
       MATCH (n)
       WHERE n.groupId = $groupId
         AND (n:Entity OR n:Episodic OR n:Community)
         AND n.embedding IS NOT NULL
+        ${dateClause}
       WITH n,
         reduce(similarity = 0.0, i IN range(0, size(n.embedding)-1) |
           similarity + (n.embedding[i] * $embedding[i])
         ) AS similarity
       ORDER BY similarity DESC
       LIMIT $limit
-      RETURN n, labels(n) as labels
+      RETURN n, labels(n) as labels, similarity
     `;
 
-    const results = await this.driver.executeQuery<any[]>(query, {
-      groupId,
-      embedding,
-      limit,
-    });
+    const queryParams: Record<string, any> = { groupId, embedding, limit };
+    if (params.validFrom) queryParams.validFrom = params.validFrom.toISOString();
+    if (params.validTo)   queryParams.validTo   = params.validTo.toISOString();
+
+    const results = await this.driver.executeQuery<any[]>(query, queryParams);
 
     const seedNodes: Node[] = results.map((result) => {
       const nodeData = result.n.properties || result.n;
@@ -527,14 +657,80 @@ Return JSON with the merged summary.`;
     const communityNodes = seedNodes.filter(
       (n): n is CommunityNodeImpl => n instanceof CommunityNodeImpl,
     );
-    const expandedNodes =
+    let expandedNodes =
       communityNodes.length > 0
         ? await this._expandCommunityMembers(seedNodes, communityNodes, groupId)
         : seedNodes;
 
-    if (!params.graphExpand) return expandedNodes;
+    if (params.graphExpand) {
+      expandedNodes = await this._expandByGraph(
+        expandedNodes,
+        groupId,
+        params.expandHops ?? 1,
+        limit,
+      );
+    }
 
-    return this._expandByGraph(expandedNodes, groupId, params.expandHops ?? 1, limit);
+    // Temporal weighting: re-rank Episodic nodes by proximity to queryTime.
+    // Applied after graph expansion so expanded nodes also participate.
+    if (params.queryTime) {
+      // Attach similarity scores from DB results to nodes for weighting
+      const scoreMap = new Map<string, number>();
+      for (const r of results) {
+        const d = r.n?.properties ?? r.n;
+        if (d?.uuid) scoreMap.set(d.uuid, r.similarity ?? 0);
+      }
+      expandedNodes = this._applyTemporalWeighting(
+        expandedNodes,
+        scoreMap,
+        params.queryTime,
+        params.temporalAlpha ?? 0.3,
+        params.halfLifeDays ?? 30,
+      );
+    }
+
+    return expandedNodes;
+  }
+
+  /**
+   * Re-rank nodes by blending the original semantic similarity score with a
+   * temporal proximity bonus for Episodic nodes.
+   *
+   * Formula:
+   *   adjustedScore = baseScore * (1 + alpha * proximityScore * contemporaneity)
+   *
+   * where:
+   *   proximityScore  = exp(-|validAt - queryTime| / halfLifeDays)
+   *   contemporaneity = exp(-retroactiveDays / 30)   [1.0 for real-time recording]
+   *
+   * Entity and Community nodes are returned at their original semantic score.
+   */
+  private _applyTemporalWeighting(
+    nodes: Node[],
+    scoreMap: Map<string, number>,
+    queryTime: Date,
+    alpha: number,
+    halfLifeDays: number,
+  ): Node[] {
+    const scored = nodes.map((node) => {
+      const baseScore = scoreMap.get(node.uuid) ?? 0;
+
+      if (!(node instanceof EpisodicNodeImpl)) {
+        return { node, score: baseScore };
+      }
+
+      const episodic = node as EpisodicNodeImpl;
+      const daysDelta =
+        Math.abs(episodic.validAt.getTime() - queryTime.getTime()) / 86_400_000;
+      const proximityScore = Math.exp(-daysDelta / halfLifeDays);
+      const contemporaneity = Math.exp(-(episodic.retroactiveDays ?? 0) / 30);
+      const adjustedScore = baseScore * (1 + alpha * proximityScore * contemporaneity);
+
+      return { node, score: adjustedScore };
+    });
+
+    scored.sort((a, b) => b.score - a.score);
+    return scored.map((s) => s.node);
   }
 
   private async _expandCommunityMembers(

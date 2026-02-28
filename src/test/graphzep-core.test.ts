@@ -149,7 +149,7 @@ describe('Graphzep Core', () => {
       assert.strictEqual(entityNodeSaves.length, 1);
     });
 
-    it('should skip negated relations', async () => {
+    it('should not create an edge for negated relations (but may query for conflicts)', async () => {
       (mockDriver.executeQuery as any).mock.resetCalls();
       (mockDriver.executeQuery as any).mock.mockImplementation(async () => []);
 
@@ -172,10 +172,12 @@ describe('Graphzep Core', () => {
 
       await graphzep.addEpisode({ content: 'Alice does not work at ACME.' });
 
-      const edgeSaves = (mockDriver.executeQuery as any).mock.calls.filter((c: any) =>
-        c.arguments[0].includes('RELATES_TO'),
+      // No MERGE of a RELATES_TO edge should happen — conflict detection
+      // uses MATCH-only queries which are allowed.
+      const edgeCreates = (mockDriver.executeQuery as any).mock.calls.filter((c: any) =>
+        c.arguments[0].includes('MERGE') && c.arguments[0].includes('RELATES_TO'),
       );
-      assert.strictEqual(edgeSaves.length, 0, 'Negated relation should not be saved');
+      assert.strictEqual(edgeCreates.length, 0, 'Negated relation should not create a RELATES_TO edge');
     });
 
     it('should mark historical relations with invalidAt', async () => {

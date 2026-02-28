@@ -35,6 +35,8 @@ export const EpisodicNodeSchema = BaseNodeSchema.extend({
   validAt: z.date(),
   invalidAt: z.date().optional(),
   referenceId: z.string().optional(),
+  retroactiveDays: z.number().optional(),
+  disputedBy: z.array(z.string()).optional(),
 });
 
 export const CommunityNodeSchema = BaseNodeSchema.extend({
@@ -161,7 +163,7 @@ export class EntityNodeImpl extends Node implements EntityNode {
           n.entityType = $entityType,
           n.summary = $summary,
           n.groupId = $groupId,
-          n.createdAt = datetime($createdAt),
+          n.createdAt = COALESCE(n.createdAt, datetime($createdAt)),
           n.factIds = $factIds
       ${this.summaryEmbedding ? 'SET n.summaryEmbedding = $summaryEmbedding, n.embedding = $summaryEmbedding' : ''}
       RETURN n
@@ -178,6 +180,8 @@ export class EpisodicNodeImpl extends Node implements EpisodicNode {
   validAt: Date;
   invalidAt?: Date;
   referenceId?: string;
+  retroactiveDays?: number;
+  disputedBy?: string[];
 
   constructor(data: EpisodicNode) {
     super(data);
@@ -187,6 +191,8 @@ export class EpisodicNodeImpl extends Node implements EpisodicNode {
     this.validAt = data.validAt;
     this.invalidAt = data.invalidAt;
     this.referenceId = data.referenceId;
+    this.retroactiveDays = data.retroactiveDays;
+    this.disputedBy = data.disputedBy;
     this.labels = ['Episodic', ...this.labels];
   }
 
@@ -202,6 +208,8 @@ export class EpisodicNodeImpl extends Node implements EpisodicNode {
       validAt: this.validAt.toISOString(),
       invalidAt: this.invalidAt?.toISOString() ?? null,
       referenceId: this.referenceId ?? null,
+      retroactiveDays: this.retroactiveDays ?? 0,
+      disputedBy: this.disputedBy ?? [],
     };
 
     const query = `
@@ -210,10 +218,12 @@ export class EpisodicNodeImpl extends Node implements EpisodicNode {
           n.episodeType = $episodeType,
           n.content = $content,
           n.groupId = $groupId,
-          n.createdAt = datetime($createdAt),
+          n.createdAt = COALESCE(n.createdAt, datetime($createdAt)),
           n.validAt = datetime($validAt),
           n.invalidAt = ${this.invalidAt ? 'datetime($invalidAt)' : 'null'},
-          n.referenceId = $referenceId
+          n.referenceId = $referenceId,
+          n.retroactiveDays = $retroactiveDays,
+          n.disputedBy = $disputedBy
       ${this.embedding ? 'SET n.embedding = $embedding' : ''}
       RETURN n
     `;

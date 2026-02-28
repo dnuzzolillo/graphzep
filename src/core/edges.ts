@@ -24,6 +24,7 @@ export const EntityEdgeSchema = BaseEdgeSchema.extend({
   expiredAt: z.date().optional(),
   validAt: z.date(),
   invalidAt: z.date().optional(),
+  disputedBy: z.array(z.string()).optional(),
 });
 
 export const EpisodicEdgeSchema = BaseEdgeSchema;
@@ -108,6 +109,7 @@ export class EntityEdgeImpl extends Edge implements EntityEdge {
   expiredAt?: Date;
   validAt: Date;
   invalidAt?: Date;
+  disputedBy?: string[];
 
   constructor(data: EntityEdge) {
     super(data);
@@ -117,6 +119,7 @@ export class EntityEdgeImpl extends Edge implements EntityEdge {
     this.expiredAt = data.expiredAt;
     this.validAt = data.validAt;
     this.invalidAt = data.invalidAt;
+    this.disputedBy = data.disputedBy;
   }
 
   async save(driver: GraphDriver): Promise<void> {
@@ -132,6 +135,7 @@ export class EntityEdgeImpl extends Edge implements EntityEdge {
       validAt: this.validAt.toISOString(),
       invalidAt: this.invalidAt?.toISOString() ?? null,
       expiredAt: this.expiredAt?.toISOString() ?? null,
+      disputedBy: this.disputedBy ?? [],
     };
 
     const query = `
@@ -145,7 +149,8 @@ export class EntityEdgeImpl extends Edge implements EntityEdge {
           e.createdAt = datetime($createdAt),
           e.validAt = datetime($validAt),
           e.invalidAt = ${this.invalidAt ? 'datetime($invalidAt)' : 'null'},
-          e.expiredAt = ${this.expiredAt ? 'datetime($expiredAt)' : 'null'}
+          e.expiredAt = ${this.expiredAt ? 'datetime($expiredAt)' : 'null'},
+          e.disputedBy = $disputedBy
       RETURN e
     `;
 
