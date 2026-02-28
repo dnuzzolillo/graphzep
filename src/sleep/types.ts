@@ -71,6 +71,27 @@ export interface SleepOptions {
      */
     similarityThreshold?: number;
   };
+
+  communities?: {
+    /** Run Phase 3. Default: true */
+    enabled?: boolean;
+    /**
+     * Minimum total entities in the graph before community detection runs.
+     * Default: 15
+     */
+    minGraphSize?: number;
+    /**
+     * Minimum entities required to form a community (smaller clusters discarded).
+     * Default: 3
+     */
+    minCommunitySize?: number;
+    /**
+     * How many new entities must exist since the last rebuild before we re-run.
+     * Set to 0 to always rebuild.
+     * Default: 10
+     */
+    rebuildThreshold?: number;
+  };
 }
 
 // ── Per-phase reports ─────────────────────────────────────────────────────────
@@ -101,6 +122,45 @@ export interface PruningReport {
   edgesPruned: number;
 }
 
+export interface CommunityReport {
+  /** true when phase 3 was skipped (not enough entities, below threshold, etc.) */
+  skipped: boolean;
+  /** Human-readable reason when skipped */
+  reason?: string;
+  /** Number of Community nodes written or updated */
+  communitiesBuilt: number;
+  /** Number of stale Community nodes removed */
+  communitiesRemoved: number;
+  /** Total entity count in the graph at the time of the run */
+  entityCount: number;
+}
+
+// ── Auto-sleep scheduler ──────────────────────────────────────────────────────
+
+export interface AutoSleepConfig {
+  /**
+   * The graph target — same value you would pass to `sleep()`.
+   * Either a plain groupId string or a `{ stmGroupId, ltmGroupId }` TierConfig.
+   */
+  target: string | TierConfig;
+  /** Sleep-cycle options forwarded to every automatic run. */
+  options?: SleepOptions;
+  /**
+   * Hour of day (0–23, local time) at which to run.
+   * Default: 3  (3 am)
+   */
+  hour?: number;
+  /**
+   * Minute (0–59, local time) at which to run.
+   * Default: 0
+   */
+  minute?: number;
+  /** Called after every successful automatic run. */
+  onComplete?: (report: SleepReport) => void;
+  /** Called when an automatic run throws. Does NOT stop the scheduler. */
+  onError?: (err: unknown) => void;
+}
+
 // ── Final report ──────────────────────────────────────────────────────────────
 
 export interface SleepReport {
@@ -114,4 +174,5 @@ export interface SleepReport {
   durationMs: number;
   phase1Consolidation: ConsolidationReport;
   phase2Pruning: PruningReport;
+  phase3Communities: CommunityReport;
 }

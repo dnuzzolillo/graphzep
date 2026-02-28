@@ -78,6 +78,16 @@ export interface CommunityNode extends BaseNode {
   summary: string;
   summaryEmbedding?: number[];
   factIds?: string[];
+  /** UUIDs of the Entity nodes that belong to this community */
+  memberEntityIds?: string[];
+  /** Number of member entities */
+  memberCount?: number;
+  /** Lowercase kebab-case domain tags, e.g. ["world-history", "sports"] */
+  domainHints?: string[];
+  /** 0–1 score reflecting how dense / factually rich this community is */
+  importanceScore?: number;
+  /** Timestamp of the most recent full community rebuild */
+  lastFullRebuild?: Date;
 }
 
 export interface EntityEdge extends BaseEdge {

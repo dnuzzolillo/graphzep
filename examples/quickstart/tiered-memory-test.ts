@@ -21,6 +21,7 @@
  *   X — Cross-article links  (4)  are entities from different articles connected?
  *   S — Sleep state          (3)  are STM markers and LTM counts correct?
  *   D — Relation coverage    (2)  do edges appear in LTM at all?
+ *   C — Community detection  (5)  did Phase 3 build searchable community clusters?
  *
  * Zero external API keys needed (MediaWiki is public).
  * No model prior-knowledge bias (all content is post-training-cutoff).
@@ -690,6 +691,12 @@ async function main(): Promise<void> {
       + `${report.phase1Consolidation.episodesConsolidated} episodes`);
     ok(`Phase 2 — merged: ${report.phase2Pruning.entitiesMerged} duplicates, `
       + `pruned: ${report.phase2Pruning.edgesPruned} orphan edges`);
+    const p3 = report.phase3Communities;
+    if (!p3.skipped) {
+      ok(`Phase 3 — communities: ${p3.communitiesBuilt} built, ${p3.communitiesRemoved} removed`);
+    } else {
+      info(`Phase 3 — skipped (${p3.reason ?? 'threshold not reached'})`);
+    }
 
     const ltmCount = await driver.executeQuery<any[]>(
       `MATCH (n:Entity {groupId: $g}) RETURN count(n) AS c`, { g: LTM_GROUP },
@@ -927,6 +934,74 @@ async function main(): Promise<void> {
        + `peers not yet in LTM at consolidation time (expected behaviour)`);
   }
 
+  // ── C — Community detection ───────────────────────────────────────────────
+  info('\n── C: Community detection ──');
+
+  // C1: every SleepReport must carry a phase3Communities field
+  check('C1', 'Phase 3 community report present in all sleep cycles',
+    sleepReports.every(r => r.phase3Communities !== undefined),
+    `cycles checked: ${sleepReports.length}`);
+
+  // C2: at least one Community node was written to LTM
+  const communityRows = await driver.executeQuery<any[]>(
+    `MATCH (c:Community {groupId: $g}) RETURN count(c) AS cnt`, { g: LTM_GROUP },
+  );
+  const communityCount = Number(communityRows[0]?.cnt ?? 0);
+  check('C2', 'At least one Community node built in LTM',
+    communityCount > 0, `communities in LTM: ${communityCount}`);
+
+  if (communityCount > 0) {
+    // C3: HAS_MEMBER edges exist
+    const memberEdgeRows = await driver.executeQuery<any[]>(
+      `MATCH (c:Community {groupId: $g})-[r:HAS_MEMBER]->(e:Entity {groupId: $g})
+       RETURN count(r) AS cnt`, { g: LTM_GROUP },
+    );
+    const memberEdgeCount = Number(memberEdgeRows[0]?.cnt ?? 0);
+    check('C3', 'Community nodes have HAS_MEMBER edges to member entities',
+      memberEdgeCount > 0, `HAS_MEMBER edges: ${memberEdgeCount}`);
+
+    // C4: embedding is set — Community nodes participate in semantic search
+    const embeddingRows = await driver.executeQuery<any[]>(
+      `MATCH (c:Community {groupId: $g}) WHERE c.embedding IS NOT NULL
+       RETURN count(c) AS cnt`, { g: LTM_GROUP },
+    );
+    const embeddingCount = Number(embeddingRows[0]?.cnt ?? 0);
+    check('C4', 'Community nodes have embedding set (searchable)',
+      embeddingCount === communityCount,
+      `${embeddingCount}/${communityCount} have embedding`);
+
+    // C5: community-guided retrieval — search using a community summary and verify
+    // that at least one member entity appears in the result (routing tier active)
+    const commWithMember = await driver.executeQuery<any[]>(
+      `MATCH (c:Community {groupId: $g})-[:HAS_MEMBER]->(e:Entity {groupId: $g})
+       RETURN c.summary AS commSummary, e.name AS memberName LIMIT 1`,
+      { g: LTM_GROUP },
+    );
+    if (commWithMember.length > 0) {
+      const commSummary = String(commWithMember[0].commSummary ?? '');
+      const memberName  = String(commWithMember[0].memberName  ?? '');
+      const searchNodes = await stmGraph.search({
+        query: commSummary, groupId: LTM_GROUP, limit: 20,
+      });
+      const memberFound = searchNodes.some((n: any) => n.name === memberName);
+      check('C5', 'Community-guided retrieval surfaces member entities in search',
+        memberFound,
+        memberFound
+          ? `"${memberName}" found via community routing`
+          : `"${memberName}" not in top-20 results`);
+    } else {
+      check('C5', 'Community-guided retrieval (skipped — no member data)', true, 'no HAS_MEMBER rows');
+    }
+  } else {
+    // Not enough entities yet — soft-skip C3-C5
+    const skipReason = sleepReports
+      .map(r => r.phase3Communities)
+      .find(p => p.skipped)?.reason ?? 'below threshold';
+    check('C3', 'Community HAS_MEMBER edges (skipped — no communities built)', true, skipReason);
+    check('C4', 'Community embedding set (skipped — no communities built)',     true, skipReason);
+    check('C5', 'Community-guided retrieval (skipped — no communities built)',  true, skipReason);
+  }
+
   // ── Q — LLM Fact Audit ────────────────────────────────────────────────────
   info('\n── Q: LLM Fact Audit ──');
 
@@ -973,6 +1048,7 @@ async function main(): Promise<void> {
   info(`STM episodes consolidated: ${totalConsolidated}/${totalEpisodesInSTM}`);
   info(`LTM entities (final): ${ltmEntityCounts[ltmEntityCounts.length - 1] ?? 0}`);
   info(`LTM edges (final)  : ${edgeCount}`);
+  info(`LTM communities    : ${communityCount}`);
   info(`Cross-batch entities: ${crossBatchEntities.length}`);
 
   // ── Query hints (from audit log) ──────────────────────────────────────────

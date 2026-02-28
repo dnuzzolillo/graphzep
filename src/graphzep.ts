@@ -521,9 +521,43 @@ Return JSON with the merged summary.`;
       throw new Error(`Unknown node type for labels: ${labels}`);
     });
 
-    if (!params.graphExpand) return seedNodes;
+    // Community-guided expansion: when Community nodes appear in results,
+    // include their member Entity nodes automatically so callers always get
+    // the concrete entities behind a matched community.
+    const communityNodes = seedNodes.filter(
+      (n): n is CommunityNodeImpl => n instanceof CommunityNodeImpl,
+    );
+    const expandedNodes =
+      communityNodes.length > 0
+        ? await this._expandCommunityMembers(seedNodes, communityNodes, groupId)
+        : seedNodes;
 
-    return this._expandByGraph(seedNodes, groupId, params.expandHops ?? 1, limit);
+    if (!params.graphExpand) return expandedNodes;
+
+    return this._expandByGraph(expandedNodes, groupId, params.expandHops ?? 1, limit);
+  }
+
+  private async _expandCommunityMembers(
+    seedNodes: Node[],
+    communityNodes: CommunityNodeImpl[],
+    groupId: string,
+  ): Promise<Node[]> {
+    const communityUuids = communityNodes.map(n => n.uuid).filter(Boolean);
+    const memberResults = await this.driver.executeQuery<any[]>(
+      `MATCH (c:Community)-[:HAS_MEMBER]->(e:Entity {groupId: $groupId})
+       WHERE c.uuid IN $communityUuids
+       RETURN e AS n, labels(e) AS labels`,
+      { communityUuids, groupId },
+    );
+    const expanded = new Map<string, Node>();
+    for (const node of seedNodes) expanded.set(node.uuid, node);
+    for (const row of memberResults) {
+      const d = row.n?.properties ?? row.n;
+      if (d?.uuid && !expanded.has(d.uuid)) {
+        expanded.set(d.uuid, new EntityNodeImpl({ ...d, labels: row.labels ?? [] }));
+      }
+    }
+    return [...expanded.values()];
   }
 
   private async _expandByGraph(

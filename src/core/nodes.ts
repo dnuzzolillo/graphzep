@@ -42,6 +42,11 @@ export const CommunityNodeSchema = BaseNodeSchema.extend({
   summary: z.string(),
   summaryEmbedding: z.array(z.number()).optional(),
   factIds: z.array(z.string()).optional(),
+  memberEntityIds: z.array(z.string()).optional(),
+  memberCount: z.number().optional(),
+  domainHints: z.array(z.string()).optional(),
+  importanceScore: z.number().min(0).max(1).optional(),
+  lastFullRebuild: z.date().optional(),
 });
 
 export abstract class Node implements BaseNode {
@@ -222,6 +227,11 @@ export class CommunityNodeImpl extends Node implements CommunityNode {
   summary: string;
   summaryEmbedding?: number[];
   factIds?: string[];
+  memberEntityIds?: string[];
+  memberCount?: number;
+  domainHints?: string[];
+  importanceScore?: number;
+  lastFullRebuild?: Date;
 
   constructor(data: CommunityNode) {
     super(data);
@@ -229,6 +239,11 @@ export class CommunityNodeImpl extends Node implements CommunityNode {
     this.summary = data.summary;
     this.summaryEmbedding = data.summaryEmbedding;
     this.factIds = data.factIds;
+    this.memberEntityIds = data.memberEntityIds;
+    this.memberCount = data.memberCount;
+    this.domainHints = data.domainHints;
+    this.importanceScore = data.importanceScore;
+    this.lastFullRebuild = data.lastFullRebuild;
     this.labels = ['Community', ...this.labels];
   }
 
@@ -238,10 +253,15 @@ export class CommunityNodeImpl extends Node implements CommunityNode {
       name: this.name,
       communityLevel: this.communityLevel,
       summary: this.summary,
-      summaryEmbedding: this.summaryEmbedding,
+      summaryEmbedding: this.summaryEmbedding ?? null,
       groupId: this.groupId,
       createdAt: this.createdAt.toISOString(),
-      factIds: this.factIds || [],
+      factIds: this.factIds ?? [],
+      memberEntityIds: this.memberEntityIds ?? null,
+      memberCount: this.memberCount ?? null,
+      domainHints: this.domainHints ?? null,
+      importanceScore: this.importanceScore ?? null,
+      lastFullRebuild: this.lastFullRebuild?.toISOString() ?? null,
     };
 
     const query = `
@@ -250,9 +270,17 @@ export class CommunityNodeImpl extends Node implements CommunityNode {
           n.communityLevel = $communityLevel,
           n.summary = $summary,
           n.summaryEmbedding = $summaryEmbedding,
+          n.embedding = $summaryEmbedding,
           n.groupId = $groupId,
           n.createdAt = datetime($createdAt),
-          n.factIds = $factIds
+          n.factIds = $factIds,
+          n.memberEntityIds = $memberEntityIds,
+          n.memberCount = $memberCount,
+          n.domainHints = $domainHints,
+          n.importanceScore = $importanceScore,
+          n.lastFullRebuild = CASE WHEN $lastFullRebuild IS NOT NULL
+                               THEN datetime($lastFullRebuild)
+                               ELSE n.lastFullRebuild END
       RETURN n
     `;
 

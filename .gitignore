@@ -153,6 +153,7 @@ Thumbs.db
 
 # Project specific
 cache.db*
+examples/tiered-memory-audit-*.json
 
 # Test artifacts
 test-results/

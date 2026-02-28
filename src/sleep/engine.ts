@@ -35,15 +35,81 @@
 
 import { Consolidator } from './consolidator.js';
 import { Pruner } from './pruner.js';
-import type { SleepEngineConfig, SleepOptions, SleepReport, TierConfig } from './types.js';
+import { CommunityBuilder } from './community-builder.js';
+import type { AutoSleepConfig, SleepEngineConfig, SleepOptions, SleepReport, TierConfig } from './types.js';
+
+/** Returns the number of milliseconds until the next occurrence of hour:minute (local time). */
+function msUntilNext(hour: number, minute: number): number {
+  const now  = new Date();
+  const next = new Date(now);
+  next.setHours(hour, minute, 0, 0);
+  if (next <= now) next.setDate(next.getDate() + 1);
+  return next.getTime() - now.getTime();
+}
 
 export class SleepEngine {
   private readonly consolidator: Consolidator;
   private readonly pruner: Pruner;
+  private readonly communityBuilder: CommunityBuilder;
+  private _autoSleepTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private readonly config: SleepEngineConfig) {
     this.consolidator = new Consolidator(config.driver, config.llm, config.embedder);
     this.pruner = new Pruner(config.driver, config.embedder);
+    this.communityBuilder = new CommunityBuilder(config.driver, config.llm, config.embedder);
+  }
+
+  /**
+   * Start an automatic nightly sleep cycle.
+   *
+   * By default runs every day at 03:00 local time.  Call `stopAutoSleep()`
+   * to cancel.  If a scheduled run throws, `onError` is called and the
+   * scheduler continues — it will retry the next day.
+   *
+   * @example — default (3 am every night)
+   * engine.startAutoSleep({ target: { stmGroupId: 'stm-alice', ltmGroupId: 'ltm-alice' } });
+   *
+   * @example — custom time + callbacks
+   * engine.startAutoSleep({
+   *   target: 'my-group',
+   *   hour: 2, minute: 30,
+   *   onComplete: report => console.log('sleep done', report.durationMs),
+   *   onError:    err    => console.error('sleep failed', err),
+   * });
+   */
+  startAutoSleep(config: AutoSleepConfig): void {
+    this.stopAutoSleep(); // cancel any existing schedule
+
+    const hour   = config.hour   ?? 3;
+    const minute = config.minute ?? 0;
+
+    const schedule = () => {
+      const ms = msUntilNext(hour, minute);
+      this._autoSleepTimer = setTimeout(async () => {
+        try {
+          const report = await this.sleep(config.target, config.options);
+          config.onComplete?.(report);
+        } catch (err) {
+          config.onError?.(err);
+        }
+        schedule(); // reschedule for the following day
+      }, ms);
+    };
+
+    schedule();
+  }
+
+  /** Cancel the automatic sleep scheduler. Safe to call even if not started. */
+  stopAutoSleep(): void {
+    if (this._autoSleepTimer !== null) {
+      clearTimeout(this._autoSleepTimer);
+      this._autoSleepTimer = null;
+    }
+  }
+
+  /** `true` while an automatic schedule is active. */
+  get isAutoSleepActive(): boolean {
+    return this._autoSleepTimer !== null;
   }
 
   /**
@@ -89,41 +155,23 @@ export class SleepEngine {
       ? await this.pruner.run(pruningTarget, options)
       : emptyPruningReport();
 
-    // ── Phase 3 — Association (REM) ───────────────────────────────────────────
-    // TODO: implement src/sleep/associator.ts
+    // ── Phase 3 — Community detection (REM analogy) ───────────────────────────
+    // Group entity nodes into semantic communities using the Louvain modularity
+    // algorithm.  Community nodes act as a routing tier in search(): when a
+    // query matches a Community, its member entities are included automatically.
     //
-    // Idea: sample pairs of episodic nodes that are NOT directly connected but
-    // whose entity sets overlap in embedding space. For each candidate pair,
-    // ask the LLM: "Is there an implicit relationship between these two events
-    // that is not already captured in the graph?" If yes and confidence is high,
-    // add an inferred RELATES_TO edge with `isInferred: true` and a lower weight.
-    //
-    // Key challenge: O(n²) pairs is infeasible at scale. Smart sampling strategies:
-    //   - Random walk from high-degree nodes
-    //   - Embedding-cluster proximity (episodes in same cluster but different episodes)
-    //   - Surprise metric: pairs that embedding says should be related but aren't connected
-    //
-    // Reference: REM sleep consolidates associative/insight memory in humans.
-    // See: Walker 2009 "The Role of Sleep in Cognition and Emotion"
+    // Rebuild is gated by a delta threshold so it only runs when enough new
+    // entities have been added since the previous community build.
+    const phase3Enabled = options.communities?.enabled !== false;
+    const communityTarget = isTiered ? target.ltmGroupId : groupId;
+    const phase3 = phase3Enabled
+      ? await this.communityBuilder.run(communityTarget, options)
+      : emptyCommunityReport();
 
-    // ── Phase 4 — Ontology refinement ─────────────────────────────────────────
+    // ── Phase 4 — Ontology refinement (planned) ───────────────────────────────
     // TODO: implement src/sleep/ontology-refiner.ts
-    //
-    // Idea: after each sleep cycle, sample the most recent extractions and ask
-    // the LLM: "What entity types and relationship patterns appear repeatedly
-    // that are not yet in the ontology schema?" Produce OntologyProposal objects
-    // with confidence scores. Auto-accept proposals above a high threshold
-    // (e.g. 0.92), queue the rest for human review in a proposals log.
-    //
-    // Critical constraint: schema changes must be versioned. A new entity type
-    // added at cycle N should not retroactively invalidate queries from cycle 0.
-    // Store ontology versions with a validFrom timestamp, similar to how the
-    // graph stores temporal validity for edges.
-    //
-    // Reference: the brain updates its "schemas" (mental models) during sleep,
-    // integrating new experiences into existing knowledge frameworks.
-    // See: Tamminen et al. 2010 "Sleep spindle activity is associated with
-    //      the integration of new memories and existing knowledge"
+    // Detect recurring entity types / relationship patterns not yet in the
+    // schema and propose versioned ontology updates.
 
     const completedAt = new Date();
 
@@ -136,6 +184,7 @@ export class SleepEngine {
       durationMs: completedAt.getTime() - startedAt.getTime(),
       phase1Consolidation: phase1,
       phase2Pruning: phase2,
+      phase3Communities: phase3,
     };
   }
 }
@@ -156,5 +205,15 @@ function emptyPruningReport() {
     entitiesMerged: 0,
     mergedPairs: [] as import('./types.js').MergedPair[],
     edgesPruned: 0,
+  };
+}
+
+function emptyCommunityReport() {
+  return {
+    skipped: true,
+    reason: 'Phase 3 disabled',
+    communitiesBuilt: 0,
+    communitiesRemoved: 0,
+    entityCount: 0,
   };
 }
