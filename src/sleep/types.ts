@@ -28,6 +28,30 @@ export interface SleepEngineConfig {
   llm: BaseLLMClient;
   /** Embedder to re-embed refreshed entity summaries */
   embedder: BaseEmbedderClient;
+  /**
+   * Default graph target used by `sleep()` when no target is passed and by
+   * `startAutoSleep()` when no target override is given.
+   * Either a plain groupId string or a `{ stmGroupId, ltmGroupId }` TierConfig.
+   */
+  target?: string | TierConfig;
+  /**
+   * Default sleep-cycle options applied to every run (manual or automatic).
+   * Can be overridden per-call.
+   */
+  defaultOptions?: SleepOptions;
+  /**
+   * Set to `true` (or a partial `AutoSleepConfig`) to start the nightly
+   * scheduler automatically when the engine is constructed.
+   *
+   * Requires `target` to be set in the engine config.
+   *
+   * @example — zero-config nightly run at 3 am
+   * new SleepEngine({ driver, llm, embedder, target: 'my-group', autoSleep: true })
+   *
+   * @example — custom time
+   * new SleepEngine({ ..., target: 'my-group', autoSleep: { hour: 2, minute: 30 } })
+   */
+  autoSleep?: boolean | Omit<AutoSleepConfig, 'target'>;
 }
 
 export interface SleepOptions {
@@ -140,9 +164,9 @@ export interface CommunityReport {
 export interface AutoSleepConfig {
   /**
    * The graph target — same value you would pass to `sleep()`.
-   * Either a plain groupId string or a `{ stmGroupId, ltmGroupId }` TierConfig.
+   * If omitted, falls back to the `target` set in `SleepEngineConfig`.
    */
-  target: string | TierConfig;
+  target?: string | TierConfig;
   /** Sleep-cycle options forwarded to every automatic run. */
   options?: SleepOptions;
   /**

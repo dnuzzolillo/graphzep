@@ -57,6 +57,12 @@ export class SleepEngine {
     this.consolidator = new Consolidator(config.driver, config.llm, config.embedder);
     this.pruner = new Pruner(config.driver, config.embedder);
     this.communityBuilder = new CommunityBuilder(config.driver, config.llm, config.embedder);
+
+    // Auto-start the nightly scheduler if requested in the constructor config
+    if (config.autoSleep) {
+      const overrides = typeof config.autoSleep === 'object' ? config.autoSleep : {};
+      this.startAutoSleep(overrides);
+    }
   }
 
   /**
@@ -66,31 +72,42 @@ export class SleepEngine {
    * to cancel.  If a scheduled run throws, `onError` is called and the
    * scheduler continues — it will retry the next day.
    *
-   * @example — default (3 am every night)
-   * engine.startAutoSleep({ target: { stmGroupId: 'stm-alice', ltmGroupId: 'ltm-alice' } });
+   * When called with no arguments (or an empty object) the engine uses the
+   * `target` and `defaultOptions` set in the constructor config.
+   *
+   * @example — zero-config (target in constructor, 3 am every night)
+   * engine.startAutoSleep();
    *
    * @example — custom time + callbacks
    * engine.startAutoSleep({
-   *   target: 'my-group',
    *   hour: 2, minute: 30,
-   *   onComplete: report => console.log('sleep done', report.durationMs),
-   *   onError:    err    => console.error('sleep failed', err),
+   *   onComplete: report => console.log('done', report.durationMs),
+   *   onError:    err    => console.error('failed', err),
    * });
    */
-  startAutoSleep(config: AutoSleepConfig): void {
+  startAutoSleep(autoConfig: AutoSleepConfig = {}): void {
     this.stopAutoSleep(); // cancel any existing schedule
 
-    const hour   = config.hour   ?? 3;
-    const minute = config.minute ?? 0;
+    const target = autoConfig.target ?? this.config.target;
+    if (!target) {
+      throw new Error(
+        'startAutoSleep() requires a target. ' +
+        'Pass it here or set `target` in the SleepEngineConfig constructor.',
+      );
+    }
+
+    const hour    = autoConfig.hour    ?? 3;
+    const minute  = autoConfig.minute  ?? 0;
+    const options = autoConfig.options ?? this.config.defaultOptions;
 
     const schedule = () => {
       const ms = msUntilNext(hour, minute);
       this._autoSleepTimer = setTimeout(async () => {
         try {
-          const report = await this.sleep(config.target, config.options);
-          config.onComplete?.(report);
+          const report = await this.sleep(target, options);
+          autoConfig.onComplete?.(report);
         } catch (err) {
-          config.onError?.(err);
+          autoConfig.onError?.(err);
         }
         schedule(); // reschedule for the following day
       }, ms);
@@ -132,27 +149,38 @@ export class SleepEngine {
    *   ltmGroupId: 'ltm-alice',
    * });
    */
-  async sleep(target: string | TierConfig, options: SleepOptions = {}): Promise<SleepReport> {
+  async sleep(target?: string | TierConfig, options?: SleepOptions): Promise<SleepReport> {
+    const resolvedTarget = target ?? this.config.target;
+    if (!resolvedTarget) {
+      throw new Error(
+        'sleep() requires a target. ' +
+        'Pass it here or set `target` in the SleepEngineConfig constructor.',
+      );
+    }
+    const resolvedOptions = options ?? this.config.defaultOptions ?? {};
+
     const startedAt  = new Date();
-    const dryRun     = options.dryRun ?? false;
-    const isTiered   = typeof target !== 'string';
-    const groupId    = isTiered ? target.stmGroupId : target;
-    const ltmGroupId = isTiered ? target.ltmGroupId : undefined;
+    const dryRun     = resolvedOptions.dryRun ?? false;
+    const isTiered   = typeof resolvedTarget !== 'string';
+    const target_    = resolvedTarget; // local alias for narrowing below
+    const options_   = resolvedOptions;
+    const groupId    = isTiered ? (target_ as TierConfig).stmGroupId : (target_ as string);
+    const ltmGroupId = isTiered ? (target_ as TierConfig).ltmGroupId : undefined;
 
     // ── Phase 1 — Consolidation ───────────────────────────────────────────────
-    const phase1Enabled = options.consolidation?.enabled !== false;
+    const phase1Enabled = options_.consolidation?.enabled !== false;
     const phase1 = phase1Enabled
       ? isTiered
-        ? await this.consolidator.runTiered(target.stmGroupId, target.ltmGroupId, options)
-        : await this.consolidator.run(groupId, options)
+        ? await this.consolidator.runTiered((target_ as TierConfig).stmGroupId, (target_ as TierConfig).ltmGroupId, options_)
+        : await this.consolidator.run(groupId, options_)
       : emptyConsolidationReport();
 
     // ── Phase 2 — Pruning & entity resolution ─────────────────────────────────
     // In tiered mode: prune only the LTM graph (STM entities are ephemeral).
-    const phase2Enabled = options.pruning?.enabled !== false;
-    const pruningTarget = isTiered ? target.ltmGroupId : groupId;
+    const phase2Enabled = options_.pruning?.enabled !== false;
+    const pruningTarget = isTiered ? (target_ as TierConfig).ltmGroupId : groupId;
     const phase2 = phase2Enabled
-      ? await this.pruner.run(pruningTarget, options)
+      ? await this.pruner.run(pruningTarget, options_)
       : emptyPruningReport();
 
     // ── Phase 3 — Community detection (REM analogy) ───────────────────────────
@@ -162,10 +190,10 @@ export class SleepEngine {
     //
     // Rebuild is gated by a delta threshold so it only runs when enough new
     // entities have been added since the previous community build.
-    const phase3Enabled = options.communities?.enabled !== false;
-    const communityTarget = isTiered ? target.ltmGroupId : groupId;
+    const phase3Enabled = options_.communities?.enabled !== false;
+    const communityTarget = isTiered ? (target_ as TierConfig).ltmGroupId : groupId;
     const phase3 = phase3Enabled
-      ? await this.communityBuilder.run(communityTarget, options)
+      ? await this.communityBuilder.run(communityTarget, options_)
       : emptyCommunityReport();
 
     // ── Phase 4 — Ontology refinement (planned) ───────────────────────────────
