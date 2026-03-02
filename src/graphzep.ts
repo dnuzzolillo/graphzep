@@ -739,14 +739,15 @@ Return JSON with the merged summary.`;
       );
       return results.map(toScored);
     } catch {
-      // Fallback: brute-force on contentEmbedding (index not yet created)
+      // Fallback: brute-force on n.embedding (exists on all episodic nodes,
+      // including those inserted before contentEmbedding was added).
       const results = await this.driver.executeQuery<any[]>(
         `MATCH (n:Episodic {groupId: $groupId})
-         WHERE n.contentEmbedding IS NOT NULL
+         WHERE n.embedding IS NOT NULL
            ${dateFilter}
          WITH n,
-           reduce(s = 0.0, i IN range(0, size(n.contentEmbedding)-1) |
-             s + (n.contentEmbedding[i] * $embedding[i])
+           reduce(s = 0.0, i IN range(0, size(n.embedding)-1) |
+             s + (n.embedding[i] * $embedding[i])
            ) AS score
          ORDER BY score DESC
          LIMIT $limit
