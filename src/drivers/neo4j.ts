@@ -5,10 +5,18 @@ import { GraphProvider } from '../types/index.js';
 export class Neo4jDriver extends BaseGraphDriver {
   provider = GraphProvider.NEO4J;
   private driver: Driver;
+  private vectorDimensions: number;
 
-  constructor(uri: string, username: string, password: string, database: string = 'neo4j') {
+  constructor(
+    uri: string,
+    username: string,
+    password: string,
+    database: string = 'neo4j',
+    options?: { vectorDimensions?: number },
+  ) {
     super(uri, username, password, database);
     this.driver = neo4j.driver(uri, neo4j.auth.basic(username, password));
+    this.vectorDimensions = options?.vectorDimensions ?? 1536;
   }
 
   async executeQuery<T = any>(query: string, params?: Record<string, any>): Promise<T> {
@@ -68,6 +76,8 @@ export class Neo4jDriver extends BaseGraphDriver {
       'CREATE INDEX episodic_group IF NOT EXISTS FOR (n:Episodic) ON (n.groupId)',
       'CREATE INDEX community_uuid IF NOT EXISTS FOR (n:Community) ON (n.uuid)',
       'CREATE INDEX community_group IF NOT EXISTS FOR (n:Community) ON (n.groupId)',
+      'CREATE INDEX episodic_valid_at IF NOT EXISTS FOR (n:Episodic) ON (n.validAt)',
+      'CREATE INDEX episodic_created_at IF NOT EXISTS FOR (n:Episodic) ON (n.createdAt)',
     ];
 
     for (const index of indexes) {
@@ -76,6 +86,18 @@ export class Neo4jDriver extends BaseGraphDriver {
       } catch (error) {
         console.warn(`Index creation warning: ${error}`);
       }
+    }
+
+    // Vector index for fast episodic content search (ANN)
+    try {
+      await this.executeQuery(
+        // eslint-disable-next-line no-useless-escape
+        `CREATE VECTOR INDEX episodic_content IF NOT EXISTS
+         FOR (n:Episodic) ON (n.contentEmbedding)
+         OPTIONS {indexConfig: {\`vector.dimensions\`: ${this.vectorDimensions}, \`vector.similarity_function\`: 'cosine'}}`,
+      );
+    } catch (error) {
+      console.warn(`Episodic vector index creation warning: ${error}`);
     }
   }
 }

@@ -143,6 +143,21 @@ const MergedEntitySchema = z.object({
   mergedSummary: z.string(),
 });
 
+/** Converts a Neo4j DateTime object, ISO string, or Date to a JS Date. */
+function coerceDate(v: any): Date {
+  if (v instanceof Date) return v;
+  // Neo4j DateTime objects expose toStandardDate() in the driver
+  if (v && typeof v.toStandardDate === 'function') return v.toStandardDate() as Date;
+  const str = typeof v === 'string' ? v : (v && typeof v.toString === 'function' ? v.toString() : '');
+  if (str) {
+    // Neo4j datetime strings have nanoseconds: "...T00:00:00.000000000Z" — strip to ms
+    const normalized = str.replace(/(\.\d{3})\d+(Z|[+-]\d{2}:\d{2}|$)/, '$1$2');
+    const d = new Date(normalized);
+    if (!isNaN(d.getTime())) return d;
+  }
+  return new Date();
+}
+
 export class Graphzep {
   private driver: GraphDriver;
   private llmClient: BaseLLMClient;
@@ -606,82 +621,36 @@ Return JSON with the merged summary.`;
     const groupId = params.groupId || this.defaultGroupId;
     const limit = Math.floor(params.limit || 10);
 
-    // Build optional date filter — applies only to Episodic nodes so Entity /
-    // Community results are never suppressed by temporal constraints.
-    const dateParts: string[] = [];
-    if (params.validFrom) dateParts.push('n.validAt >= datetime($validFrom)');
-    if (params.validTo)   dateParts.push('n.validAt <= datetime($validTo)');
-    const dateClause = dateParts.length > 0
-      ? `AND (NOT (n:Episodic) OR (${dateParts.join(' AND ')}))`
-      : '';
+    // Run entity+community and episodic searches in parallel, then RRF-merge.
+    const [entityScored, episodicScored] = await Promise.all([
+      this._searchEntityCommunity(embedding, groupId, limit),
+      this._searchEpisodic(embedding, groupId, limit, params),
+    ]);
 
-    const query = `
-      MATCH (n)
-      WHERE n.groupId = $groupId
-        AND (n:Entity OR n:Episodic OR n:Community)
-        AND n.embedding IS NOT NULL
-        ${dateClause}
-      WITH n,
-        reduce(similarity = 0.0, i IN range(0, size(n.embedding)-1) |
-          similarity + (n.embedding[i] * $embedding[i])
-        ) AS similarity
-      ORDER BY similarity DESC
-      LIMIT $limit
-      RETURN n, labels(n) as labels, similarity
-    `;
+    const merged = this._rrfMerge([entityScored, episodicScored], limit);
 
-    const queryParams: Record<string, any> = { groupId, embedding, limit };
-    if (params.validFrom) queryParams.validFrom = params.validFrom.toISOString();
-    if (params.validTo)   queryParams.validTo   = params.validTo.toISOString();
+    // Build scoreMap (RRF scores) for temporal weighting downstream.
+    const scoreMap = new Map<string, number>();
+    for (const { node, score } of merged) scoreMap.set(node.uuid, score);
 
-    const results = await this.driver.executeQuery<any[]>(query, queryParams);
+    let seedNodes: Node[] = merged.map((m) => m.node);
 
-    const seedNodes: Node[] = results.map((result) => {
-      const nodeData = result.n.properties || result.n;
-      const labels = result.labels || [];
-
-      if (labels.includes('Entity')) {
-        return new EntityNodeImpl({ ...nodeData, labels });
-      } else if (labels.includes('Episodic')) {
-        return new EpisodicNodeImpl({ ...nodeData, labels });
-      } else if (labels.includes('Community')) {
-        return new CommunityNodeImpl({ ...nodeData, labels });
-      }
-
-      throw new Error(`Unknown node type for labels: ${labels}`);
-    });
-
-    // Community-guided expansion: when Community nodes appear in results,
-    // include their member Entity nodes automatically so callers always get
-    // the concrete entities behind a matched community.
+    // Community-guided expansion: include member Entity nodes automatically.
     const communityNodes = seedNodes.filter(
       (n): n is CommunityNodeImpl => n instanceof CommunityNodeImpl,
     );
-    let expandedNodes =
-      communityNodes.length > 0
-        ? await this._expandCommunityMembers(seedNodes, communityNodes, groupId)
-        : seedNodes;
+    if (communityNodes.length > 0) {
+      seedNodes = await this._expandCommunityMembers(seedNodes, communityNodes, groupId);
+    }
 
     if (params.graphExpand) {
-      expandedNodes = await this._expandByGraph(
-        expandedNodes,
-        groupId,
-        params.expandHops ?? 1,
-        limit,
-      );
+      seedNodes = await this._expandByGraph(seedNodes, groupId, params.expandHops ?? 1, limit);
     }
 
     // Temporal weighting: re-rank Episodic nodes by proximity to queryTime.
-    // Applied after graph expansion so expanded nodes also participate.
     if (params.queryTime) {
-      // Attach similarity scores from DB results to nodes for weighting
-      const scoreMap = new Map<string, number>();
-      for (const r of results) {
-        const d = r.n?.properties ?? r.n;
-        if (d?.uuid) scoreMap.set(d.uuid, r.similarity ?? 0);
-      }
-      expandedNodes = this._applyTemporalWeighting(
-        expandedNodes,
+      seedNodes = this._applyTemporalWeighting(
+        seedNodes,
         scoreMap,
         params.queryTime,
         params.temporalAlpha ?? 0.3,
@@ -689,7 +658,127 @@ Return JSON with the merged summary.`;
       );
     }
 
-    return expandedNodes;
+    return seedNodes;
+  }
+
+  /** Brute-force cosine search over Entity and Community nodes. */
+  private async _searchEntityCommunity(
+    embedding: number[],
+    groupId: string,
+    limit: number,
+  ): Promise<Array<{ node: Node; score: number }>> {
+    const results = await this.driver.executeQuery<any[]>(
+      `MATCH (n)
+       WHERE n.groupId = $groupId
+         AND (n:Entity OR n:Community)
+         AND n.embedding IS NOT NULL
+       WITH n,
+         reduce(s = 0.0, i IN range(0, size(n.embedding)-1) |
+           s + (n.embedding[i] * $embedding[i])
+         ) AS similarity
+       ORDER BY similarity DESC
+       LIMIT $limit
+       RETURN n, labels(n) AS labels, similarity`,
+      { groupId, embedding, limit },
+    );
+    return results.map((r) => {
+      const d = r.n?.properties ?? r.n;
+      const labels: string[] = r.labels ?? [];
+      const node = labels.includes('Community')
+        ? new CommunityNodeImpl({ ...d, labels })
+        : new EntityNodeImpl({ ...d, labels });
+      return { node, score: r.similarity ?? 0 };
+    });
+  }
+
+  /**
+   * ANN search over Episodic nodes using the `episodic_content` vector index.
+   * Falls back to brute-force cosine if the index doesn't exist yet.
+   * Date range filters (validFrom / validTo) are applied inline.
+   */
+  private async _searchEpisodic(
+    embedding: number[],
+    groupId: string,
+    limit: number,
+    params: SearchParams,
+  ): Promise<Array<{ node: Node; score: number }>> {
+    const dateParts: string[] = [];
+    if (params.validFrom) dateParts.push('n.validAt >= datetime($validFrom)');
+    if (params.validTo) dateParts.push('n.validAt <= datetime($validTo)');
+    const dateFilter = dateParts.length > 0 ? `AND (${dateParts.join(' AND ')})` : '';
+
+    // Oversample from the index to absorb groupId filtering loss.
+    const vecK = limit * 3;
+    const qp: Record<string, any> = { groupId, embedding, limit, vecK };
+    if (params.validFrom) qp.validFrom = params.validFrom.toISOString();
+    if (params.validTo) qp.validTo = params.validTo.toISOString();
+
+    const toScored = (r: any): { node: Node; score: number } => {
+      const d = r.n?.properties ?? r.n;
+      return {
+        node: new EpisodicNodeImpl({
+          ...d,
+          labels: r.labels ?? [],
+          validAt: coerceDate(d.validAt),
+          invalidAt: d.invalidAt ? coerceDate(d.invalidAt) : undefined,
+        }),
+        score: r.score ?? 0,
+      };
+    };
+
+    try {
+      // Primary: vector index (fast ANN)
+      const results = await this.driver.executeQuery<any[]>(
+        `CALL db.index.vector.queryNodes('episodic_content', $vecK, $embedding)
+         YIELD node AS n, score
+         WHERE n.groupId = $groupId
+           ${dateFilter}
+         RETURN n, labels(n) AS labels, score
+         LIMIT $limit`,
+        qp,
+      );
+      return results.map(toScored);
+    } catch {
+      // Fallback: brute-force on contentEmbedding (index not yet created)
+      const results = await this.driver.executeQuery<any[]>(
+        `MATCH (n:Episodic {groupId: $groupId})
+         WHERE n.contentEmbedding IS NOT NULL
+           ${dateFilter}
+         WITH n,
+           reduce(s = 0.0, i IN range(0, size(n.contentEmbedding)-1) |
+             s + (n.contentEmbedding[i] * $embedding[i])
+           ) AS score
+         ORDER BY score DESC
+         LIMIT $limit
+         RETURN n, labels(n) AS labels, score`,
+        qp,
+      );
+      return results.map(toScored);
+    }
+  }
+
+  /**
+   * Reciprocal Rank Fusion: merge multiple ranked lists into one.
+   * k=60 is the standard constant from the original RRF paper.
+   */
+  private _rrfMerge(
+    lists: Array<Array<{ node: Node; score: number }>>,
+    limit: number,
+    k: number = 60,
+  ): Array<{ node: Node; score: number }> {
+    const scores = new Map<string, { node: Node; score: number }>();
+    for (const list of lists) {
+      list.forEach(({ node }, rank) => {
+        const rrf = 1 / (k + rank + 1);
+        const existing = scores.get(node.uuid);
+        if (existing) {
+          existing.score += rrf;
+        } else {
+          scores.set(node.uuid, { node, score: rrf });
+        }
+      });
+    }
+    return [...scores.values()].sort((a, b) => b.score - a.score).slice(0, limit);
   }
 
   /**
@@ -723,7 +812,7 @@ Return JSON with the merged summary.`;
       const daysDelta =
         Math.abs(episodic.validAt.getTime() - queryTime.getTime()) / 86_400_000;
       const proximityScore = Math.exp(-daysDelta / halfLifeDays);
-      const contemporaneity = Math.exp(-(episodic.retroactiveDays ?? 0) / 30);
+      const contemporaneity = Math.exp(-Number(episodic.retroactiveDays ?? 0) / 30);
       const adjustedScore = baseScore * (1 + alpha * proximityScore * contemporaneity);
 
       return { node, score: adjustedScore };
@@ -908,16 +997,6 @@ Return JSON with the merged summary.`;
        RETURN e`,
       { groupId, uuids: allUuids },
     );
-
-    const coerceDate = (v: any): Date => {
-      if (v instanceof Date) return v;
-      if (v && typeof v === 'object' && typeof v.toString === 'function') {
-        const d = new Date(v.toString());
-        if (!isNaN(d.getTime())) return d;
-      }
-      if (typeof v === 'string') return new Date(v);
-      return new Date();
-    };
 
     const edgeMap = new Map<string, EntityEdgeImpl>();
     for (const row of edgeResults) {

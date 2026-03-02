@@ -224,7 +224,7 @@ export class EpisodicNodeImpl extends Node implements EpisodicNode {
           n.referenceId = $referenceId,
           n.retroactiveDays = $retroactiveDays,
           n.disputedBy = $disputedBy
-      ${this.embedding ? 'SET n.embedding = $embedding' : ''}
+      ${this.embedding ? 'SET n.embedding = $embedding, n.contentEmbedding = $embedding' : ''}
       RETURN n
     `;
 
