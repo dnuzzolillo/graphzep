@@ -67,8 +67,20 @@ export class Pruner {
     };
 
     // ── Part A: Entity deduplication ─────────────────────────────────────────
-    const candidates = await this.fetchCandidatePairs(groupId);
-    const scored = this.scorePairs(candidates, threshold);
+    // Two candidate detection strategies run in parallel:
+    //   1. Substring-containment (existing): "UK" ⊂ "United Kingdom"
+    //   2. Anchor-token sharing (new): "ticket 20258006" ~ "Order 20258006"
+    const [substringPairs, tokenPairs] = await Promise.all([
+      this.fetchCandidatePairs(groupId),
+      this.fetchTokenCandidatePairs(groupId),
+    ]);
+    const pairsSeen = new Set<string>();
+    const allCandidates: EntityCandidate[] = [];
+    for (const c of [...substringPairs, ...tokenPairs]) {
+      const key = c.uuidA < c.uuidB ? `${c.uuidA}|${c.uuidB}` : `${c.uuidB}|${c.uuidA}`;
+      if (!pairsSeen.has(key)) { pairsSeen.add(key); allCandidates.push(c); }
+    }
+    const scored = this.scorePairs(allCandidates, threshold);
 
     // Greedy merge: highest similarity first, skip if either node already merged
     const alreadyMerged = new Set<string>();
@@ -278,6 +290,81 @@ export class Pruner {
       { groupId },
     );
     return Number(result[0]?.total ?? 0);
+  }
+
+  /** Extract numeric sequences of 5+ digits (order IDs, ticket IDs, etc.). */
+  private extractAnchorTokens(name: string): string[] {
+    const matches = name.match(/\d{5,}/g);
+    return matches ? [...new Set(matches)] : [];
+  }
+
+  /**
+   * Find entity pairs that share a numeric anchor token in their names
+   * (e.g. "ticket 20258006" and "Order 20258006").
+   *
+   * Strategy:
+   *   1. Load all entity names + degrees in one query (no embeddings yet).
+   *   2. Build a token → entities index in TypeScript.
+   *   3. For each token with ≥ 2 entities: emit candidate pairs.
+   *   4. Fetch embeddings only for the candidate nodes (targeted, not full-table).
+   *
+   * The existing `scorePairs()` then applies the same cosine-similarity
+   * threshold as substring candidates, guarding against false positives.
+   */
+  private async fetchTokenCandidatePairs(groupId: string): Promise<EntityCandidate[]> {
+    // Load names and degrees only — embeddings fetched lazily below
+    const rows = await this.driver.executeQuery<any[]>(
+      `MATCH (n:Entity {groupId: $groupId})
+       RETURN n.uuid AS uuid, n.name AS name,
+              size([(n)-[:RELATES_TO|MENTIONS]-() | 1]) AS degree`,
+      { groupId },
+    );
+
+    // Build token → entity index
+    const tokenIndex = new Map<string, Array<{ uuid: string; name: string; degree: number }>>();
+    for (const r of rows) {
+      for (const t of this.extractAnchorTokens(r.name ?? '')) {
+        if (!tokenIndex.has(t)) tokenIndex.set(t, []);
+        tokenIndex.get(t)!.push({ uuid: r.uuid, name: r.name, degree: Number(r.degree ?? 0) });
+      }
+    }
+
+    // Collect candidate pairs sharing a token
+    const pairKeys = new Set<string>();
+    const pairList: [string, string][] = [];
+    for (const matches of tokenIndex.values()) {
+      if (matches.length < 2) continue;
+      for (let i = 0; i < matches.length; i++) {
+        for (let j = i + 1; j < matches.length; j++) {
+          const a = matches[i], b = matches[j];
+          if (!a.uuid || !b.uuid || a.name === b.name) continue;
+          const key = a.uuid < b.uuid ? `${a.uuid}|${b.uuid}` : `${b.uuid}|${a.uuid}`;
+          if (!pairKeys.has(key)) { pairKeys.add(key); pairList.push([a.uuid, b.uuid]); }
+        }
+      }
+    }
+
+    if (pairList.length === 0) return [];
+
+    // Fetch embeddings only for the nodes that appear in candidate pairs
+    const uuidsNeeded = [...new Set(pairList.flat())];
+    const embRows = await this.driver.executeQuery<any[]>(
+      `MATCH (n:Entity {groupId: $groupId})
+       WHERE n.uuid IN $uuids
+       RETURN n.uuid AS uuid, n.summaryEmbedding AS emb`,
+      { groupId, uuids: uuidsNeeded },
+    );
+    const embMap = new Map(embRows.map(r => [r.uuid as string, Array.isArray(r.emb) ? r.emb as number[] : null]));
+    const metaMap = new Map(rows.map(r => [r.uuid as string, { name: r.name as string, degree: Number(r.degree ?? 0) }]));
+
+    return pairList.map(([uuidA, uuidB]) => {
+      const a = metaMap.get(uuidA)!;
+      const b = metaMap.get(uuidB)!;
+      return {
+        uuidA, nameA: a.name, embA: embMap.get(uuidA) ?? null, degreeA: a.degree,
+        uuidB, nameB: b.name, embB: embMap.get(uuidB) ?? null, degreeB: b.degree,
+      };
+    });
   }
 }
 

@@ -83,6 +83,12 @@ export interface SleepOptions {
      * Default: 50
      */
     maxEntities?: number;
+    /**
+     * Maximum parallel LLM calls during consolidation.
+     * Higher values reduce wall-clock time but increase API rate-limit risk.
+     * Default: 5
+     */
+    concurrency?: number;
   };
 
   pruning?: {

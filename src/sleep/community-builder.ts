@@ -287,11 +287,34 @@ export class CommunityBuilder {
 
       if (dryRun) continue;
 
-      // LLM: synthesise community name, summary, domain hints
-      const memberSummaries = members
-        .slice(0, 20) // cap at 20 to keep the prompt compact
-        .map((e, i) => `${i + 1}. "${e.name}" (${e.entityType}): ${e.summary}`)
-        .join('\n');
+      // LLM: synthesise community name, summary, domain hints.
+      // For large communities (> DIRECT_THRESHOLD), chunk members and summarise
+      // each chunk in parallel first, then synthesise from the partial summaries.
+      const DIRECT_THRESHOLD = 30;
+      const CHUNK_SIZE = 25;
+
+      let memberSummaries: string;
+      if (members.length <= DIRECT_THRESHOLD) {
+        memberSummaries = members
+          .map((e, i) => `${i + 1}. "${e.name}" (${e.entityType}): ${e.summary}`)
+          .join('\n');
+      } else {
+        const chunks: EntityRecord[][] = [];
+        for (let ci = 0; ci < members.length; ci += CHUNK_SIZE) {
+          chunks.push(members.slice(ci, ci + CHUNK_SIZE));
+        }
+        const chunkResults = await Promise.allSettled(
+          chunks.map(chunk => this._summarizeMemberChunk(chunk)),
+        );
+        const partials: string[] = [];
+        for (let ci = 0; ci < chunkResults.length; ci++) {
+          const r = chunkResults[ci];
+          if (r.status === 'fulfilled') {
+            partials.push(`Subgroup ${ci + 1} (${chunks[ci].length} entities): ${r.value}`);
+          }
+        }
+        memberSummaries = partials.join('\n');
+      }
 
       const prompt = `You are analysing a semantic community (cluster) of entities in a knowledge graph.
 
@@ -378,5 +401,21 @@ importanceScore: 0.0-1.0 reflecting how densely connected and factually rich thi
       communitiesRemoved: staleUuids.length,
       entityCount: entities.length,
     };
+  }
+
+  /**
+   * Summarise a chunk of member entities into a single sentence.
+   * Used as the first pass of hierarchical community summarisation when
+   * a community has more than DIRECT_THRESHOLD members.
+   */
+  private async _summarizeMemberChunk(chunk: EntityRecord[]): Promise<string> {
+    const text = chunk
+      .map((e, i) => `${i + 1}. "${e.name}" (${e.entityType}): ${e.summary}`)
+      .join('\n');
+    const result = await this.llm.generateStructuredResponse(
+      `Summarise what these entities have in common in 1-2 concise sentences:\n${text}`,
+      z.object({ summary: z.string() }),
+    );
+    return result.summary;
   }
 }

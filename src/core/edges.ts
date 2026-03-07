@@ -25,6 +25,7 @@ export const EntityEdgeSchema = BaseEdgeSchema.extend({
   validAt: z.date(),
   invalidAt: z.date().optional(),
   disputedBy: z.array(z.string()).optional(),
+  confidence: z.number().min(0).max(1).optional(),
 });
 
 export const EpisodicEdgeSchema = BaseEdgeSchema;
@@ -110,6 +111,7 @@ export class EntityEdgeImpl extends Edge implements EntityEdge {
   validAt: Date;
   invalidAt?: Date;
   disputedBy?: string[];
+  confidence?: number;
 
   constructor(data: EntityEdge) {
     super(data);
@@ -120,6 +122,7 @@ export class EntityEdgeImpl extends Edge implements EntityEdge {
     this.validAt = data.validAt;
     this.invalidAt = data.invalidAt;
     this.disputedBy = data.disputedBy;
+    this.confidence = data.confidence;
   }
 
   async save(driver: GraphDriver): Promise<void> {
@@ -136,6 +139,7 @@ export class EntityEdgeImpl extends Edge implements EntityEdge {
       invalidAt: this.invalidAt?.toISOString() ?? null,
       expiredAt: this.expiredAt?.toISOString() ?? null,
       disputedBy: this.disputedBy ?? [],
+      confidence: this.confidence ?? null,
     };
 
     const query = `
@@ -150,7 +154,8 @@ export class EntityEdgeImpl extends Edge implements EntityEdge {
           e.validAt = datetime($validAt),
           e.invalidAt = ${this.invalidAt ? 'datetime($invalidAt)' : 'null'},
           e.expiredAt = ${this.expiredAt ? 'datetime($expiredAt)' : 'null'},
-          e.disputedBy = $disputedBy
+          e.disputedBy = $disputedBy,
+          e.confidence = $confidence
       RETURN e
     `;
 

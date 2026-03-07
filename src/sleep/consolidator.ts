@@ -81,6 +81,7 @@ export class Consolidator {
     const cooldown = options.cooldownMinutes ?? 5;
     const minEpisodes = options.consolidation?.minEpisodes ?? 2;
     const maxEntities = options.consolidation?.maxEntities ?? 50;
+    const concurrency = options.consolidation?.concurrency ?? 5;
     const dryRun = options.dryRun ?? false;
 
     const report: ConsolidationReport = {
@@ -90,52 +91,59 @@ export class Consolidator {
       entitiesProcessed: [],
     };
 
-    // ── Step 1: Find entities with enough unconsolidated episodes ─────────────
     const clusters = await this.fetchEntityClusters(groupId, cooldown, minEpisodes, maxEntities);
-
     if (clusters.length === 0) return report;
 
-    // ── Step 2: For each cluster, synthesise an improved summary ──────────────
-    for (const cluster of clusters) {
-      const prompt = this.buildPrompt(cluster);
-
-      let synthesis: z.infer<typeof EntitySynthesisSchema>;
-      try {
-        synthesis = await this.llm.generateStructuredResponse(prompt, EntitySynthesisSchema);
-      } catch {
-        // If structured response fails, skip this entity rather than crashing
-        continue;
-      }
-
-      report.tokensUsed += estimateTokens(prompt) + estimateTokens(synthesis.summary);
-
-      if (dryRun) {
-        report.entitiesProcessed.push(cluster.name);
+    // Process clusters in parallel batches to reduce wall-clock time.
+    // `concurrency` caps simultaneous LLM calls to avoid rate-limit errors.
+    for (let i = 0; i < clusters.length; i += concurrency) {
+      const batch = clusters.slice(i, i + concurrency);
+      const settled = await Promise.allSettled(
+        batch.map(cluster => this._processCluster(cluster, dryRun)),
+      );
+      for (const s of settled) {
+        if (s.status !== 'fulfilled' || !s.value) continue;
+        const r = s.value;
+        report.tokensUsed += r.tokensUsed;
         report.entitiesRefreshed++;
-        report.episodesConsolidated += cluster.episodeUuids.length;
-        continue;
+        report.episodesConsolidated += r.episodeCount;
+        report.entitiesProcessed.push(r.name);
       }
-
-      // ── Step 3: Re-embed the new summary ──────────────────────────────────
-      let embedding: number[];
-      try {
-        embedding = await this.embedder.embed(synthesis.summary);
-      } catch {
-        continue;
-      }
-
-      // ── Step 4: Write updated entity back to graph ─────────────────────────
-      await this.updateEntity(cluster.uuid, synthesis.summary, embedding);
-
-      // ── Step 5: Mark episodes as consolidated ──────────────────────────────
-      await this.markConsolidated(cluster.episodeUuids);
-
-      report.entitiesRefreshed++;
-      report.episodesConsolidated += cluster.episodeUuids.length;
-      report.entitiesProcessed.push(cluster.name);
     }
 
     return report;
+  }
+
+  /** Process a single entity cluster: synthesise → embed → write → mark. */
+  private async _processCluster(
+    cluster: EntityCluster,
+    dryRun: boolean,
+  ): Promise<{ tokensUsed: number; episodeCount: number; name: string } | null> {
+    const prompt = this.buildPrompt(cluster);
+    let synthesis: z.infer<typeof EntitySynthesisSchema>;
+    try {
+      synthesis = await this.llm.generateStructuredResponse(prompt, EntitySynthesisSchema);
+    } catch {
+      return null;
+    }
+
+    const tokensUsed = estimateTokens(prompt) + estimateTokens(synthesis.summary);
+
+    if (dryRun) {
+      return { tokensUsed, episodeCount: cluster.episodeUuids.length, name: cluster.name };
+    }
+
+    let embedding: number[];
+    try {
+      embedding = await this.embedder.embed(synthesis.summary);
+    } catch {
+      return null;
+    }
+
+    await this.updateEntity(cluster.uuid, synthesis.summary, embedding);
+    await this.markConsolidated(cluster.episodeUuids);
+
+    return { tokensUsed, episodeCount: cluster.episodeUuids.length, name: cluster.name };
   }
 
   // ── Private helpers ─────────────────────────────────────────────────────────
@@ -263,85 +271,92 @@ Return JSON with the updated summary and your confidence score.`;
       entitiesProcessed: [],
     };
 
+    const concurrency = options.consolidation?.concurrency ?? 5;
+
     const clusters = await this.fetchEntityClusters(stmGroupId, cooldown, minEpisodes, maxEntities);
     if (clusters.length === 0) return report;
 
-    for (const cluster of clusters) {
-      // ── Synthesise new summary from STM episodes ──────────────────────────
-      const stmPrompt = this.buildPrompt(cluster);
-      let stmSynthesis: { summary: string; confidence: number };
-      try {
-        stmSynthesis = await this.llm.generateStructuredResponse(stmPrompt, EntitySynthesisSchema);
-      } catch {
-        continue;
-      }
-      report.tokensUsed += estimateTokens(stmPrompt) + estimateTokens(stmSynthesis.summary);
-
-      if (dryRun) {
-        report.entitiesProcessed.push(cluster.name);
-        report.entitiesRefreshed++;
-        report.episodesConsolidated += cluster.episodeUuids.length;
-        continue;
-      }
-
-      // ── Embed the synthesis (used for T1 vector search + LTM write) ───────
-      let stmEmbedding: number[];
-      try {
-        stmEmbedding = await this.embedder.embed(stmSynthesis.summary);
-      } catch {
-        continue;
-      }
-
-      // ── T1: find counterpart in LTM ───────────────────────────────────────
-      const ltmCounterpart = await this.lookupLTMCounterpart(
-        cluster.name, stmEmbedding, ltmGroupId,
+    for (let i = 0; i < clusters.length; i += concurrency) {
+      const batch = clusters.slice(i, i + concurrency);
+      const settled = await Promise.allSettled(
+        batch.map(cluster => this._processTieredCluster(cluster, dryRun, stmGroupId, ltmGroupId)),
       );
-
-      let ltmEntityUuid: string;
-
-      if (ltmCounterpart) {
-        // ── T2: fetch 1-hop neighbourhood for richer merge context ───────────
-        const neighborhood = await this.fetchLTMNeighborhood(ltmCounterpart.uuid, ltmGroupId);
-
-        const mergePrompt = this.buildMergePrompt(
-          cluster.name, ltmCounterpart.summary, neighborhood, stmSynthesis.summary,
-        );
-        let merged: { summary: string; confidence: number };
-        try {
-          merged = await this.llm.generateStructuredResponse(mergePrompt, EntitySynthesisSchema);
-        } catch {
-          merged = stmSynthesis;
-        }
-        report.tokensUsed += estimateTokens(mergePrompt) + estimateTokens(merged.summary);
-
-        let mergedEmbedding: number[];
-        try {
-          mergedEmbedding = await this.embedder.embed(merged.summary);
-        } catch {
-          mergedEmbedding = stmEmbedding;
-        }
-
-        await this.updateEntity(ltmCounterpart.uuid, merged.summary, mergedEmbedding);
-        ltmEntityUuid = ltmCounterpart.uuid;
-      } else {
-        // No counterpart → create new entity in LTM
-        ltmEntityUuid = await this.createLTMEntity(
-          cluster, stmSynthesis.summary, stmEmbedding, ltmGroupId,
-        );
+      for (const s of settled) {
+        if (s.status !== 'fulfilled' || !s.value) continue;
+        const r = s.value;
+        report.tokensUsed += r.tokensUsed;
+        report.entitiesRefreshed++;
+        report.episodesConsolidated += r.episodeCount;
+        report.entitiesProcessed.push(r.name);
       }
-
-      // ── T3: migrate STM relations into LTM ───────────────────────────────
-      await this.migrateRelations(cluster.uuid, ltmEntityUuid, stmGroupId, ltmGroupId);
-
-      // ── Mark STM episodes as consolidated ────────────────────────────────
-      await this.markConsolidated(cluster.episodeUuids);
-
-      report.entitiesRefreshed++;
-      report.episodesConsolidated += cluster.episodeUuids.length;
-      report.entitiesProcessed.push(cluster.name);
     }
 
     return report;
+  }
+
+  /** Tiered variant: STM synthesis → LTM merge/create → relation migration. */
+  private async _processTieredCluster(
+    cluster: EntityCluster,
+    dryRun: boolean,
+    stmGroupId: string,
+    ltmGroupId: string,
+  ): Promise<{ tokensUsed: number; episodeCount: number; name: string } | null> {
+    const stmPrompt = this.buildPrompt(cluster);
+    let stmSynthesis: z.infer<typeof EntitySynthesisSchema>;
+    try {
+      stmSynthesis = await this.llm.generateStructuredResponse(stmPrompt, EntitySynthesisSchema);
+    } catch {
+      return null;
+    }
+
+    let tokensUsed = estimateTokens(stmPrompt) + estimateTokens(stmSynthesis.summary);
+
+    if (dryRun) {
+      return { tokensUsed, episodeCount: cluster.episodeUuids.length, name: cluster.name };
+    }
+
+    let stmEmbedding: number[];
+    try {
+      stmEmbedding = await this.embedder.embed(stmSynthesis.summary);
+    } catch {
+      return null;
+    }
+
+    const ltmCounterpart = await this.lookupLTMCounterpart(cluster.name, stmEmbedding, ltmGroupId);
+    let ltmEntityUuid: string;
+
+    if (ltmCounterpart) {
+      const neighborhood = await this.fetchLTMNeighborhood(ltmCounterpart.uuid, ltmGroupId);
+      const mergePrompt = this.buildMergePrompt(
+        cluster.name, ltmCounterpart.summary, neighborhood, stmSynthesis.summary,
+      );
+      let merged: z.infer<typeof EntitySynthesisSchema>;
+      try {
+        merged = await this.llm.generateStructuredResponse(mergePrompt, EntitySynthesisSchema);
+      } catch {
+        merged = stmSynthesis;
+      }
+      tokensUsed += estimateTokens(mergePrompt) + estimateTokens(merged.summary);
+
+      let mergedEmbedding: number[];
+      try {
+        mergedEmbedding = await this.embedder.embed(merged.summary);
+      } catch {
+        mergedEmbedding = stmEmbedding;
+      }
+
+      await this.updateEntity(ltmCounterpart.uuid, merged.summary, mergedEmbedding);
+      ltmEntityUuid = ltmCounterpart.uuid;
+    } else {
+      ltmEntityUuid = await this.createLTMEntity(
+        cluster, stmSynthesis.summary, stmEmbedding, ltmGroupId,
+      );
+    }
+
+    await this.migrateRelations(cluster.uuid, ltmEntityUuid, stmGroupId, ltmGroupId);
+    await this.markConsolidated(cluster.episodeUuids);
+
+    return { tokensUsed, episodeCount: cluster.episodeUuids.length, name: cluster.name };
   }
 
   // ── T1: LTM counterpart lookup ─────────────────────────────────────────────

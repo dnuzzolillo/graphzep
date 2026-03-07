@@ -103,6 +103,8 @@ export interface EntityEdge extends BaseEdge {
   invalidAt?: Date;
   /** UUIDs of episodes that dispute this relation. */
   disputedBy?: string[];
+  /** LLM extraction confidence (0–1). Higher = more clearly stated in source text. */
+  confidence?: number;
 }
 
 export interface EpisodicEdge extends BaseEdge {}

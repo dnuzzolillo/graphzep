@@ -88,16 +88,31 @@ export class Neo4jDriver extends BaseGraphDriver {
       }
     }
 
-    // Vector index for fast episodic content search (ANN)
-    try {
-      await this.executeQuery(
-        // eslint-disable-next-line no-useless-escape
-        `CREATE VECTOR INDEX episodic_content IF NOT EXISTS
-         FOR (n:Episodic) ON (n.contentEmbedding)
-         OPTIONS {indexConfig: {\`vector.dimensions\`: ${this.vectorDimensions}, \`vector.similarity_function\`: 'cosine'}}`,
-      );
-    } catch (error) {
-      console.warn(`Episodic vector index creation warning: ${error}`);
+    // Vector indexes for ANN search (replaces brute-force cosine reduce())
+    const vectorIndexes = [
+      // eslint-disable-next-line no-useless-escape
+      [`CREATE VECTOR INDEX episodic_content IF NOT EXISTS
+        FOR (n:Episodic) ON (n.contentEmbedding)
+        OPTIONS {indexConfig: {\`vector.dimensions\`: ${this.vectorDimensions}, \`vector.similarity_function\`: 'cosine'}}`,
+        'Episodic content'],
+      // eslint-disable-next-line no-useless-escape
+      [`CREATE VECTOR INDEX entity_embedding IF NOT EXISTS
+        FOR (n:Entity) ON (n.embedding)
+        OPTIONS {indexConfig: {\`vector.dimensions\`: ${this.vectorDimensions}, \`vector.similarity_function\`: 'cosine'}}`,
+        'Entity embedding'],
+      // eslint-disable-next-line no-useless-escape
+      [`CREATE VECTOR INDEX community_embedding IF NOT EXISTS
+        FOR (n:Community) ON (n.embedding)
+        OPTIONS {indexConfig: {\`vector.dimensions\`: ${this.vectorDimensions}, \`vector.similarity_function\`: 'cosine'}}`,
+        'Community embedding'],
+    ] as const;
+
+    for (const [query, label] of vectorIndexes) {
+      try {
+        await this.executeQuery(query);
+      } catch (error) {
+        console.warn(`${label} vector index creation warning: ${error}`);
+      }
     }
   }
 }

@@ -206,7 +206,8 @@ export class Graphzep {
 
     await episodicNode.save(this.driver);
 
-    const existingEntities = await this.fetchExistingEntities(groupId, embedding);
+    const anchorTokens = this.extractAnchorTokens(params.content);
+    const existingEntities = await this.fetchExistingEntities(groupId, embedding, anchorTokens);
     const extractedData = await this.extractEntitiesAndRelations(params.content, existingEntities);
 
     const entityNodes = await this.processExtractedEntities(extractedData.entities, groupId);
@@ -221,7 +222,10 @@ export class Graphzep {
   private async fetchExistingEntities(
     groupId: string,
     episodeEmbedding?: number[],
+    anchorTokens?: string[],
   ): Promise<Array<{ uuid: string; name: string; entityType: string }>> {
+    let primary: Array<{ uuid: string; name: string; entityType: string }>;
+
     if (!episodeEmbedding) {
       const result = await this.driver.executeQuery<any[]>(
         `MATCH (n:Entity {groupId: $groupId})
@@ -230,45 +234,69 @@ export class Graphzep {
          LIMIT 20`,
         { groupId },
       );
-      return result
+      primary = result
         .map(r => ({ uuid: r.uuid ?? '', name: r.name ?? '', entityType: r.entityType ?? '' }))
         .filter(e => e.name);
+    } else {
+      // Fetch semantic candidates from DB — wider pool to re-rank afterwards
+      const candidates = await this.driver.executeQuery<any[]>(
+        `MATCH (n:Entity {groupId: $groupId})
+         WHERE n.summaryEmbedding IS NOT NULL
+         WITH n,
+           reduce(sim = 0.0, i IN range(0, size(n.summaryEmbedding)-1) |
+             sim + (n.summaryEmbedding[i] * $embedding[i])
+           ) AS semanticScore
+         WHERE semanticScore > $threshold
+         RETURN n.uuid AS uuid, n.name AS name, n.entityType AS entityType,
+                semanticScore, n.createdAt AS createdAt
+         ORDER BY semanticScore DESC
+         LIMIT $pool`,
+        { groupId, embedding: episodeEmbedding, threshold: 0.65, pool: 50 },
+      );
+
+      if (candidates.length === 0) {
+        primary = [];
+      } else {
+        // Re-rank: semantic relevance + recency (exponential decay, half-life ~7 days)
+        const now = Date.now();
+        const ALPHA = 0.7;   // weight for semantic score
+        const LAMBDA = 0.1;  // decay rate: score = e^(-lambda * ageDays)
+
+        primary = candidates
+          .map(r => {
+            const ageDays = (now - new Date(r.createdAt).getTime()) / 86_400_000;
+            const recencyScore = Math.exp(-LAMBDA * ageDays);
+            const finalScore = ALPHA * r.semanticScore + (1 - ALPHA) * recencyScore;
+            return { uuid: r.uuid ?? '', name: r.name ?? '', entityType: r.entityType ?? '', finalScore };
+          })
+          .filter(e => e.name)
+          .sort((a, b) => b.finalScore - a.finalScore)
+          .slice(0, 20)
+          .map(({ uuid, name, entityType }) => ({ uuid, name, entityType }));
+      }
     }
 
-    // Fetch semantic candidates from DB — wider pool to re-rank afterwards
-    const candidates = await this.driver.executeQuery<any[]>(
-      `MATCH (n:Entity {groupId: $groupId})
-       WHERE n.summaryEmbedding IS NOT NULL
-       WITH n,
-         reduce(sim = 0.0, i IN range(0, size(n.summaryEmbedding)-1) |
-           sim + (n.summaryEmbedding[i] * $embedding[i])
-         ) AS semanticScore
-       WHERE semanticScore > $threshold
-       RETURN n.uuid AS uuid, n.name AS name, n.entityType AS entityType,
-              semanticScore, n.createdAt AS createdAt
-       ORDER BY semanticScore DESC
-       LIMIT $pool`,
-      { groupId, embedding: episodeEmbedding, threshold: 0.65, pool: 50 },
-    );
+    // Supplement with token-based matches so cross-language references to the
+    // same entity (e.g. "ticket 20258006" vs "Order 20258006") are surfaced in
+    // the LLM extraction context, enabling the model to reuse the canonical name.
+    if (anchorTokens && anchorTokens.length > 0) {
+      const seen = new Set(primary.map(e => e.uuid));
+      const tokenRows = await this.driver.executeQuery<any[]>(
+        `MATCH (n:Entity {groupId: $groupId})
+         WHERE ANY(t IN $tokens WHERE n.name CONTAINS t)
+         RETURN n.uuid AS uuid, n.name AS name, n.entityType AS entityType
+         LIMIT 10`,
+        { groupId, tokens: anchorTokens },
+      );
+      for (const r of tokenRows) {
+        if (r.uuid && r.name && !seen.has(r.uuid)) {
+          primary.push({ uuid: r.uuid, name: r.name, entityType: r.entityType ?? '' });
+          seen.add(r.uuid);
+        }
+      }
+    }
 
-    if (candidates.length === 0) return [];
-
-    // Re-rank: semantic relevance + recency (exponential decay, half-life ~7 days)
-    const now = Date.now();
-    const ALPHA = 0.7;   // weight for semantic score
-    const LAMBDA = 0.1;  // decay rate: score = e^(-lambda * ageDays)
-
-    return candidates
-      .map(r => {
-        const ageDays = (now - new Date(r.createdAt).getTime()) / 86_400_000;
-        const recencyScore = Math.exp(-LAMBDA * ageDays);
-        const finalScore = ALPHA * r.semanticScore + (1 - ALPHA) * recencyScore;
-        return { uuid: r.uuid ?? '', name: r.name ?? '', entityType: r.entityType ?? '', finalScore };
-      })
-      .filter(e => e.name)
-      .sort((a, b) => b.finalScore - a.finalScore)
-      .slice(0, 20)
-      .map(({ uuid, name, entityType }) => ({ uuid, name, entityType }));
+    return primary;
   }
 
   private async extractEntitiesAndRelations(
@@ -374,7 +402,20 @@ Respond with valid JSON:
     return processedEntities;
   }
 
+  /**
+   * Extract numeric anchor tokens (5+ digit sequences) from a text string.
+   * These are likely unique identifiers: order IDs, ticket IDs, etc.
+   * Used to resolve cross-language / cross-terminology entity references
+   * where the same real-world entity appears with different surface names
+   * (e.g. "ticket 20258006" in Spanish vs "Order 20258006" in English).
+   */
+  private extractAnchorTokens(text: string): string[] {
+    const matches = text.match(/\d{5,}/g);
+    return matches ? [...new Set(matches)] : [];
+  }
+
   private async findExistingEntity(name: string, groupId: string): Promise<EntityNodeImpl | null> {
+    // 1. Exact name match (primary path — zero overhead for known entities)
     const result = await this.driver.executeQuery<any[]>(
       `
       MATCH (n:Entity {name: $name, groupId: $groupId})
@@ -384,11 +425,42 @@ Respond with valid JSON:
       { name, groupId },
     );
 
-    if (result.length === 0) {
-      return null;
+    if (result.length > 0) {
+      const raw = result[0].n;
+      const props = (raw?.properties ?? raw) as Record<string, any>;
+      return new EntityNodeImpl({
+        uuid: props.uuid ?? '',
+        name: props.name ?? '',
+        groupId: props.groupId ?? groupId,
+        entityType: props.entityType ?? '',
+        summary: props.summary ?? '',
+        summaryEmbedding: props.summaryEmbedding ?? undefined,
+        factIds: props.factIds ?? [],
+        labels: [],
+        createdAt: props.createdAt ? new Date(props.createdAt) : new Date(),
+      });
     }
 
-    const raw = result[0].n;
+    // 2. Anchor-token fallback: match by shared numeric ID (e.g. order/ticket numbers).
+    //    This resolves cross-language duplicates where the entity name differs but the
+    //    embedded identifier is the same ("ticket 20258006" === "Order 20258006").
+    //    Returns the most-connected candidate (highest degree = canonical entity).
+    const tokens = this.extractAnchorTokens(name);
+    if (tokens.length === 0) return null;
+
+    const tokenMatches = await this.driver.executeQuery<any[]>(
+      `MATCH (n:Entity {groupId: $groupId})
+       WHERE ANY(t IN $tokens WHERE n.name CONTAINS t)
+       WITH n, size([(n)-[:RELATES_TO|MENTIONS]-() | 1]) AS degree
+       RETURN n, degree
+       ORDER BY degree DESC
+       LIMIT 5`,
+      { groupId, tokens },
+    );
+
+    if (tokenMatches.length === 0) return null;
+
+    const raw = tokenMatches[0].n;
     const props = (raw?.properties ?? raw) as Record<string, any>;
     return new EntityNodeImpl({
       uuid: props.uuid ?? '',
@@ -496,6 +568,9 @@ Return JSON with the merged summary.`;
             existingEdge.episodes.push(episodeUuid);
           }
           existingEdge.validAt = utcNow();
+          // Keep the highest confidence seen across all supporting episodes
+          const newConf = relation.confidence ?? 1.0;
+          existingEdge.confidence = Math.max(existingEdge.confidence ?? 0, newConf);
           await existingEdge.save(this.driver);
         } else {
           const edge = new EntityEdgeImpl({
@@ -510,6 +585,7 @@ Return JSON with the merged summary.`;
             // Historical relations are stored but immediately marked as invalid
             invalidAt: (relation.temporalValidity ?? 'current') === 'historical' ? utcNow() : undefined,
             createdAt: utcNow(),
+            confidence: relation.confidence ?? 1.0,
           });
 
           await edge.save(this.driver);
@@ -613,6 +689,7 @@ Return JSON with the merged summary.`;
       invalidAt: props.invalidAt ? new Date(props.invalidAt) : undefined,
       expiredAt: props.expiredAt ? new Date(props.expiredAt) : undefined,
       createdAt: props.createdAt ? new Date(props.createdAt) : new Date(),
+      confidence: props.confidence != null ? Number(props.confidence) : undefined,
     });
   }
 
@@ -661,34 +738,71 @@ Return JSON with the merged summary.`;
     return seedNodes;
   }
 
-  /** Brute-force cosine search over Entity and Community nodes. */
+  /**
+   * ANN search over Entity and Community nodes using vector indexes.
+   * Runs two parallel index queries (one per label) and merges by score.
+   * Falls back to brute-force cosine if the indexes don't exist yet.
+   */
   private async _searchEntityCommunity(
     embedding: number[],
     groupId: string,
     limit: number,
   ): Promise<Array<{ node: Node; score: number }>> {
-    const results = await this.driver.executeQuery<any[]>(
-      `MATCH (n)
-       WHERE n.groupId = $groupId
-         AND (n:Entity OR n:Community)
-         AND n.embedding IS NOT NULL
-       WITH n,
-         reduce(s = 0.0, i IN range(0, size(n.embedding)-1) |
-           s + (n.embedding[i] * $embedding[i])
-         ) AS similarity
-       ORDER BY similarity DESC
-       LIMIT $limit
-       RETURN n, labels(n) AS labels, similarity`,
-      { groupId, embedding, limit },
-    );
-    return results.map((r) => {
+    // Oversample to absorb groupId filtering loss (same ratio as episodic search).
+    const vecK = limit * 3;
+
+    const toScored = (r: any): { node: Node; score: number } => {
       const d = r.n?.properties ?? r.n;
       const labels: string[] = r.labels ?? [];
       const node = labels.includes('Community')
         ? new CommunityNodeImpl({ ...d, labels })
         : new EntityNodeImpl({ ...d, labels });
-      return { node, score: r.similarity ?? 0 };
-    });
+      return { node, score: r.score ?? 0 };
+    };
+
+    try {
+      // Primary: two parallel ANN index queries (Entity + Community)
+      const [entityRows, communityRows] = await Promise.all([
+        this.driver.executeQuery<any[]>(
+          `CALL db.index.vector.queryNodes('entity_embedding', $vecK, $embedding)
+           YIELD node AS n, score
+           WHERE n.groupId = $groupId
+           RETURN n, labels(n) AS labels, score
+           LIMIT $limit`,
+          { groupId, embedding, vecK, limit },
+        ),
+        this.driver.executeQuery<any[]>(
+          `CALL db.index.vector.queryNodes('community_embedding', $vecK, $embedding)
+           YIELD node AS n, score
+           WHERE n.groupId = $groupId
+           RETURN n, labels(n) AS labels, score
+           LIMIT $limit`,
+          { groupId, embedding, vecK, limit },
+        ),
+      ]);
+
+      return [...entityRows, ...communityRows]
+        .map(toScored)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, limit);
+    } catch {
+      // Fallback: brute-force cosine (indexes not yet created)
+      const results = await this.driver.executeQuery<any[]>(
+        `MATCH (n)
+         WHERE n.groupId = $groupId
+           AND (n:Entity OR n:Community)
+           AND n.embedding IS NOT NULL
+         WITH n,
+           reduce(s = 0.0, i IN range(0, size(n.embedding)-1) |
+             s + (n.embedding[i] * $embedding[i])
+           ) AS score
+         ORDER BY score DESC
+         LIMIT $limit
+         RETURN n, labels(n) AS labels, score`,
+        { groupId, embedding, limit },
+      );
+      return results.map(toScored);
+    }
   }
 
   /**
@@ -863,7 +977,9 @@ Return JSON with the merged summary.`;
     const neighborResults = await this.driver.executeQuery<any[]>(
       `MATCH (seed:Entity {groupId: $groupId})-[:RELATES_TO*1..${hops}]-(neighbor:Entity {groupId: $groupId})
        WHERE seed.uuid IN $seedUuids AND NOT neighbor.uuid IN $seedUuids
-       RETURN DISTINCT neighbor AS n, labels(neighbor) AS nodeLabels
+       WITH neighbor, labels(neighbor) AS nodeLabels, count(*) AS pathCount
+       ORDER BY pathCount DESC
+       RETURN neighbor AS n, nodeLabels
        LIMIT $expandLimit`,
       { groupId, seedUuids, expandLimit },
     );
