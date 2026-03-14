@@ -54,23 +54,23 @@
     "@opensearch-project/opensearch": "^2.12.0",
     "aws-sdk": "^2.1600.0",
     "dotenv": "^16.4.5",
-    "redis": "^4.7.0",
     "groq-sdk": "^0.7.0",
-    "neo4j-driver": "^5.26.0",
+    "neo4j-driver": "^6.0.1",
     "openai": "^4.73.0",
     "posthog-node": "^4.0.0",
+    "redis": "^4.7.0",
     "uuid": "^10.0.0",
     "zod": "^3.24.0"
   },
   "devDependencies": {
+    "@eslint/js": "^9.0.0",
     "@types/node": "^22.0.0",
     "@types/uuid": "^10.0.0",
-    "@eslint/js": "^9.0.0",
-    "typescript-eslint": "^8.0.0",
     "eslint": "^9.0.0",
     "prettier": "^3.4.0",
     "tsx": "^4.0.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "typescript-eslint": "^8.0.0"
   },
   "engines": {
     "node": ">=20.0.0"
