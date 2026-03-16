@@ -34,9 +34,10 @@
  */
 
 import { Consolidator } from './consolidator.js';
+import { FactConsolidator } from './fact-consolidator.js';
 import { Pruner } from './pruner.js';
 import { CommunityBuilder } from './community-builder.js';
-import type { AutoSleepConfig, SleepEngineConfig, SleepOptions, SleepReport, TierConfig } from './types.js';
+import type { AutoSleepConfig, FactConsolidationReport, SleepEngineConfig, SleepOptions, SleepReport, TierConfig } from './types.js';
 
 /** Returns the number of milliseconds until the next occurrence of hour:minute (local time). */
 function msUntilNext(hour: number, minute: number): number {
@@ -49,12 +50,14 @@ function msUntilNext(hour: number, minute: number): number {
 
 export class SleepEngine {
   private readonly consolidator: Consolidator;
+  private readonly factConsolidator: FactConsolidator;
   private readonly pruner: Pruner;
   private readonly communityBuilder: CommunityBuilder;
   private _autoSleepTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private readonly config: SleepEngineConfig) {
     this.consolidator = new Consolidator(config.driver, config.llm, config.embedder);
+    this.factConsolidator = new FactConsolidator(config.driver, config.llm, config.embedder);
     this.pruner = new Pruner(config.driver, config.embedder);
     this.communityBuilder = new CommunityBuilder(config.driver, config.llm, config.embedder);
 
@@ -175,6 +178,12 @@ export class SleepEngine {
         : await this.consolidator.run(groupId, options_)
       : emptyConsolidationReport();
 
+    // ── Phase 1b — Fact consolidation (Mem0-inspired) ─────────────────────────
+    const phase1bEnabled = options_.factConsolidation?.enabled !== false;
+    const phase1b: FactConsolidationReport = phase1bEnabled
+      ? await this.factConsolidator.run(groupId, resolvedOptions)
+      : emptyFactConsolidationReport();
+
     // ── Phase 2 — Pruning & entity resolution ─────────────────────────────────
     // In tiered mode: prune only the LTM graph (STM entities are ephemeral).
     const phase2Enabled = options_.pruning?.enabled !== false;
@@ -211,6 +220,7 @@ export class SleepEngine {
       completedAt,
       durationMs: completedAt.getTime() - startedAt.getTime(),
       phase1Consolidation: phase1,
+      phase1bFactConsolidation: phase1b,
       phase2Pruning: phase2,
       phase3Communities: phase3,
     };
@@ -225,6 +235,13 @@ function emptyConsolidationReport() {
     episodesConsolidated: 0,
     tokensUsed: 0,
     entitiesProcessed: [] as string[],
+  };
+}
+
+function emptyFactConsolidationReport(): FactConsolidationReport {
+  return {
+    factsAdded: 0, factsUpdated: 0, factsDeleted: 0, factsSkipped: 0,
+    episodesProcessed: 0, tokensUsed: 0,
   };
 }
 

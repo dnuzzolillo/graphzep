@@ -69,6 +69,15 @@ export interface SleepOptions {
    */
   cooldownMinutes?: number;
 
+  factConsolidation?: {
+    /** Run fact extraction. Default: true */
+    enabled?: boolean;
+    /** Maximum episodes to process per cycle. Default: 50 */
+    maxEpisodes?: number;
+    /** Episodes per LLM batch. Default: 10 */
+    batchSize?: number;
+  };
+
   consolidation?: {
     /** Run Phase 1. Default: true */
     enabled?: boolean;
@@ -193,6 +202,15 @@ export interface AutoSleepConfig {
 
 // ── Final report ──────────────────────────────────────────────────────────────
 
+export interface FactConsolidationReport {
+  factsAdded: number;
+  factsUpdated: number;
+  factsDeleted: number;
+  factsSkipped: number;
+  episodesProcessed: number;
+  tokensUsed: number;
+}
+
 export interface SleepReport {
   /** STM groupId (or the single groupId in legacy mode) */
   groupId: string;
@@ -203,6 +221,7 @@ export interface SleepReport {
   completedAt: Date;
   durationMs: number;
   phase1Consolidation: ConsolidationReport;
+  phase1bFactConsolidation: FactConsolidationReport;
   phase2Pruning: PruningReport;
   phase3Communities: CommunityReport;
 }

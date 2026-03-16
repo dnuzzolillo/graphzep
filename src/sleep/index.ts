@@ -1,5 +1,6 @@
 export { SleepEngine } from './engine.js';
 export { CommunityBuilder } from './community-builder.js';
+export { FactConsolidator } from './fact-consolidator.js';
 export type {
   SleepEngineConfig,
   SleepOptions,
@@ -7,6 +8,7 @@ export type {
   TierConfig,
   AutoSleepConfig,
   ConsolidationReport,
+  FactConsolidationReport,
   PruningReport,
   MergedPair,
   CommunityReport,

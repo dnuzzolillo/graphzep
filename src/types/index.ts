@@ -61,6 +61,8 @@ export interface EntityNode extends BaseNode {
   summary: string;
   summaryEmbedding?: number[];
   factIds?: string[];
+  metadata?: Record<string, unknown>;
+  pinned?: boolean;
 }
 
 export interface EpisodicNode extends BaseNode {

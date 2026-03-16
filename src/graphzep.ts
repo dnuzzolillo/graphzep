@@ -4,10 +4,11 @@ import {
   EpisodicNode,
   EpisodeType,
 } from './types/index.js';
-import { Node, EntityNodeImpl, EpisodicNodeImpl, CommunityNodeImpl } from './core/nodes.js';
+import { Node, EntityNodeImpl, EpisodicNodeImpl, CommunityNodeImpl, FactNodeImpl } from './core/nodes.js';
 import { Edge, EntityEdgeImpl, EpisodicEdgeImpl, CommunityEdgeImpl } from './core/edges.js';
 import { BaseLLMClient } from './llm/client.js';
 import { BaseEmbedderClient } from './embedders/client.js';
+import { FactConsolidator } from './sleep/fact-consolidator.js';
 import { utcNow } from './utils/datetime.js';
 
 export interface GraphzepConfig {
@@ -16,6 +17,10 @@ export interface GraphzepConfig {
   embedder: BaseEmbedderClient;
   groupId?: string;
   ensureAscii?: boolean;
+  /** Extract atomic facts inline during addEpisode(). Requires an extra LLM call per episode. */
+  inlineFacts?: boolean;
+  /** Optional separate LLM for inline fact extraction (defaults to llmClient). */
+  factLlm?: BaseLLMClient;
 }
 
 export interface AddEpisodeParams {
@@ -164,6 +169,7 @@ export class Graphzep {
   private embedder: BaseEmbedderClient;
   private defaultGroupId: string;
   private ensureAscii: boolean;
+  private factConsolidator: FactConsolidator | null;
 
   constructor(config: GraphzepConfig) {
     this.driver = config.driver;
@@ -171,6 +177,9 @@ export class Graphzep {
     this.embedder = config.embedder;
     this.defaultGroupId = config.groupId || 'default';
     this.ensureAscii = config.ensureAscii ?? false;
+    this.factConsolidator = config.inlineFacts
+      ? new FactConsolidator(config.driver, config.factLlm ?? config.llmClient, config.embedder)
+      : null;
   }
 
   async addEpisode(params: AddEpisodeParams): Promise<EpisodicNode> {
@@ -215,6 +224,14 @@ export class Graphzep {
     await this.linkEpisodeToEntities(episodicNode, entityNodes);
 
     await this.processExtractedRelations(extractedData.relations, entityNodes, groupId, episodicNode.uuid);
+
+    // Inline fact extraction: extract atomic facts and deduplicate against existing Fact nodes.
+    // Runs in background (fire-and-forget) to avoid slowing down addEpisode().
+    if (this.factConsolidator) {
+      this.factConsolidator
+        .extractForEpisode(episodicNode.uuid, params.content, groupId)
+        .catch(() => {}); // Swallow errors — fact extraction is best-effort
+    }
 
     return episodicNode;
   }
@@ -326,6 +343,7 @@ Rules:
 7. confidence: 0.0–1.0 — how clearly stated the entity or relation is in the text.
 8. isNegated: true if the text explicitly denies the relation (e.g. "Alice does NOT work at ACME").
 9. temporalValidity: "historical" if the relation is past or explicitly ended (e.g. "used to", "formerly", "left", "was").
+10. If an entity is a Person and the text mentions their phone number or email, include it in the metadata field: {"phone": "+34...", "email": "user@example.com"}.
 
 Respond with valid JSON:
 {
@@ -334,7 +352,8 @@ Respond with valid JSON:
       "name": "string",
       "entityType": "${entityTypesStr.split(' | ')[0]} | ...",
       "summary": "string",
-      "confidence": 0.0
+      "confidence": 0.0,
+      "metadata": {}
     }
   ],
   "relations": [
@@ -377,6 +396,10 @@ Respond with valid JSON:
         if (!existing.entityType || existing.entityType === 'Unknown') {
           existing.entityType = entity.entityType;
         }
+        // Shallow-merge metadata from extraction into existing entity
+        if (entity.metadata && Object.keys(entity.metadata).length > 0) {
+          existing.metadata = { ...(existing.metadata ?? {}), ...entity.metadata };
+        }
 
         await existing.save(this.driver); // MERGE on uuid → updates in place
         processedEntities.push(existing);
@@ -392,6 +415,7 @@ Respond with valid JSON:
           summaryEmbedding: embedding,
           labels: [],
           createdAt: utcNow(),
+          metadata: entity.metadata,
         });
 
         await entityNode.save(this.driver);
@@ -438,6 +462,8 @@ Respond with valid JSON:
         factIds: props.factIds ?? [],
         labels: [],
         createdAt: props.createdAt ? new Date(props.createdAt) : new Date(),
+        metadata: Graphzep._parseMetadataJson(props.metadataJson),
+        pinned: props.pinned ?? false,
       });
     }
 
@@ -472,6 +498,8 @@ Respond with valid JSON:
       factIds: props.factIds ?? [],
       labels: [],
       createdAt: props.createdAt ? new Date(props.createdAt) : new Date(),
+      metadata: Graphzep._parseMetadataJson(props.metadataJson),
+      pinned: props.pinned ?? false,
     });
   }
 
@@ -693,6 +721,53 @@ Return JSON with the merged summary.`;
     });
   }
 
+  /**
+   * Search with scores — returns nodes with their RRF/temporal scores attached.
+   */
+  async searchWithScores(params: SearchParams): Promise<Array<{ node: Node; score: number }>> {
+    const embedding = await this.embedder.embed(params.query);
+    const groupId = params.groupId || this.defaultGroupId;
+    const limit = Math.floor(params.limit || 10);
+
+    const [entityScored, episodicScored] = await Promise.all([
+      this._searchEntityCommunity(embedding, groupId, limit),
+      this._searchEpisodic(embedding, groupId, limit, params),
+    ]);
+
+    const merged = this._rrfMerge([entityScored, episodicScored], limit);
+
+    const scoreMap = new Map<string, number>();
+    for (const { node, score } of merged) scoreMap.set(node.uuid, score);
+
+    let seedNodes: Node[] = merged.map((m) => m.node);
+
+    const communityNodes = seedNodes.filter(
+      (n): n is CommunityNodeImpl => n instanceof CommunityNodeImpl,
+    );
+    if (communityNodes.length > 0) {
+      seedNodes = await this._expandCommunityMembers(seedNodes, communityNodes, groupId);
+    }
+
+    if (params.graphExpand) {
+      seedNodes = await this._expandByGraph(seedNodes, groupId, params.expandHops ?? 1, limit);
+    }
+
+    if (params.queryTime) {
+      seedNodes = this._applyTemporalWeighting(
+        seedNodes,
+        scoreMap,
+        params.queryTime,
+        params.temporalAlpha ?? 0.3,
+        params.halfLifeDays ?? 30,
+      );
+    }
+
+    return seedNodes.map((node) => ({
+      node,
+      score: scoreMap.get(node.uuid) ?? 0,
+    }));
+  }
+
   async search(params: SearchParams): Promise<Node[]> {
     const embedding = await this.embedder.embed(params.query);
     const groupId = params.groupId || this.defaultGroupId;
@@ -873,6 +948,58 @@ Return JSON with the merged summary.`;
   }
 
   /**
+   * ANN search over Fact nodes (consolidated knowledge from the Sleep Engine).
+   * Falls back to brute-force cosine if the vector index doesn't exist yet.
+   */
+  private async _searchFacts(
+    embedding: number[],
+    groupId: string,
+    limit: number,
+  ): Promise<Array<{ node: Node; score: number }>> {
+    const vecK = limit * 3;
+
+    const toScored = (r: any): { node: Node; score: number } => {
+      const d = r.n?.properties ?? r.n;
+      return {
+        node: new FactNodeImpl({ ...d, labels: r.labels ?? ['Fact'] }),
+        score: r.score ?? 0,
+      };
+    };
+
+    try {
+      const results = await this.driver.executeQuery<any[]>(
+        `CALL db.index.vector.queryNodes('fact_embedding', $vecK, $embedding)
+         YIELD node AS n, score
+         WHERE n.groupId = $groupId
+         RETURN n, labels(n) AS labels, score
+         LIMIT $limit`,
+        { groupId, embedding, vecK, limit },
+      );
+      return results.map(toScored);
+    } catch {
+      // Fallback: brute-force cosine (index not yet created or no Fact nodes)
+      try {
+        const results = await this.driver.executeQuery<any[]>(
+          `MATCH (n:Fact {groupId: $groupId})
+           WHERE n.embedding IS NOT NULL
+           WITH n,
+             reduce(s = 0.0, i IN range(0, size(n.embedding)-1) |
+               s + (n.embedding[i] * $embedding[i])
+             ) AS score
+           ORDER BY score DESC
+           LIMIT $limit
+           RETURN n, labels(n) AS labels, score`,
+          { groupId, embedding, limit },
+        );
+        return results.map(toScored);
+      } catch {
+        // No Fact nodes exist yet — return empty list
+        return [];
+      }
+    }
+  }
+
+  /**
    * Reciprocal Rank Fusion: merge multiple ranked lists into one.
    * k=60 is the standard constant from the original RRF paper.
    */
@@ -1009,6 +1136,9 @@ Return JSON with the merged summary.`;
   async deleteNode(uuid: string): Promise<void> {
     const node = await this.getNode(uuid);
     if (node) {
+      if (node instanceof EntityNodeImpl && (node as EntityNodeImpl).pinned) {
+        throw new Error(`Cannot delete pinned entity "${node.name}" (uuid: ${uuid}). Unpin it first.`);
+      }
       await node.delete(this.driver);
     }
   }
@@ -1017,6 +1147,121 @@ Return JSON with the merged summary.`;
     const edge = await this.getEdge(uuid);
     if (edge) {
       await edge.delete(this.driver);
+    }
+  }
+
+  /**
+   * Create (or merge) an entity directly, bypassing LLM extraction.
+   * Useful for explicit contact creation via tools.
+   */
+  async createEntity(params: {
+    name: string;
+    entityType: string;
+    summary: string;
+    groupId?: string;
+    metadata?: Record<string, unknown>;
+    pinned?: boolean;
+    labels?: string[];
+  }): Promise<EntityNodeImpl> {
+    const groupId = params.groupId || this.defaultGroupId;
+    const existing = await this.findExistingEntity(params.name, groupId);
+
+    if (existing) {
+      // Merge: update summary, metadata, pinned
+      if (params.summary && params.summary !== existing.summary) {
+        const mergedSummary = await this.mergeEntitySummary(
+          params.name,
+          existing.summary,
+          params.summary,
+        );
+        existing.summary = mergedSummary;
+        existing.summaryEmbedding = await this.embedder.embed(mergedSummary);
+      }
+      if (params.metadata && Object.keys(params.metadata).length > 0) {
+        existing.metadata = { ...(existing.metadata ?? {}), ...params.metadata };
+      }
+      if (params.pinned !== undefined) {
+        existing.pinned = params.pinned;
+      }
+      if (!existing.entityType || existing.entityType === 'Unknown') {
+        existing.entityType = params.entityType;
+      }
+      await existing.save(this.driver);
+      return existing;
+    }
+
+    const embedding = await this.embedder.embed(params.summary);
+    const entityNode = new EntityNodeImpl({
+      uuid: '',
+      name: params.name,
+      groupId,
+      entityType: params.entityType,
+      summary: params.summary,
+      summaryEmbedding: embedding,
+      labels: params.labels ?? [],
+      createdAt: utcNow(),
+      metadata: params.metadata,
+      pinned: params.pinned,
+    });
+
+    await entityNode.save(this.driver);
+    return entityNode;
+  }
+
+  /**
+   * Create (or update) a RELATES_TO edge between two entities resolved by name.
+   */
+  async createRelation(params: {
+    sourceName: string;
+    targetName: string;
+    relationName: string;
+    groupId?: string;
+    confidence?: number;
+  }): Promise<EntityEdgeImpl | null> {
+    const groupId = params.groupId || this.defaultGroupId;
+    const source = await this.findExistingEntity(params.sourceName, groupId);
+    const target = await this.findExistingEntity(params.targetName, groupId);
+
+    if (!source || !target) return null;
+
+    const existing = await this.findExistingRelation(
+      source.uuid,
+      target.uuid,
+      params.relationName,
+    );
+
+    if (existing) {
+      existing.validAt = utcNow();
+      existing.confidence = Math.max(existing.confidence ?? 0, params.confidence ?? 1.0);
+      await existing.save(this.driver);
+      return existing;
+    }
+
+    const edge = new EntityEdgeImpl({
+      uuid: '',
+      groupId,
+      sourceNodeUuid: source.uuid,
+      targetNodeUuid: target.uuid,
+      name: params.relationName,
+      factIds: [],
+      episodes: [],
+      validAt: utcNow(),
+      createdAt: utcNow(),
+      confidence: params.confidence ?? 1.0,
+    });
+
+    await edge.save(this.driver);
+    return edge;
+  }
+
+  /** Parse a JSON string stored in Neo4j back into an object. */
+  static _parseMetadataJson(raw: any): Record<string, unknown> | undefined {
+    if (!raw || raw === 'null') return undefined;
+    try {
+      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      return parsed && typeof parsed === 'object' ? parsed : undefined;
+    } catch {
+      return undefined;
     }
   }
 

@@ -76,6 +76,8 @@ export class Neo4jDriver extends BaseGraphDriver {
       'CREATE INDEX episodic_group IF NOT EXISTS FOR (n:Episodic) ON (n.groupId)',
       'CREATE INDEX community_uuid IF NOT EXISTS FOR (n:Community) ON (n.uuid)',
       'CREATE INDEX community_group IF NOT EXISTS FOR (n:Community) ON (n.groupId)',
+      'CREATE INDEX fact_uuid IF NOT EXISTS FOR (n:Fact) ON (n.uuid)',
+      'CREATE INDEX fact_group IF NOT EXISTS FOR (n:Fact) ON (n.groupId)',
       'CREATE INDEX episodic_valid_at IF NOT EXISTS FOR (n:Episodic) ON (n.validAt)',
       'CREATE INDEX episodic_created_at IF NOT EXISTS FOR (n:Episodic) ON (n.createdAt)',
     ];
@@ -105,6 +107,11 @@ export class Neo4jDriver extends BaseGraphDriver {
         FOR (n:Community) ON (n.embedding)
         OPTIONS {indexConfig: {\`vector.dimensions\`: ${this.vectorDimensions}, \`vector.similarity_function\`: 'cosine'}}`,
         'Community embedding'],
+      // eslint-disable-next-line no-useless-escape
+      [`CREATE VECTOR INDEX fact_embedding IF NOT EXISTS
+        FOR (n:Fact) ON (n.embedding)
+        OPTIONS {indexConfig: {\`vector.dimensions\`: ${this.vectorDimensions}, \`vector.similarity_function\`: 'cosine'}}`,
+        'Fact embedding'],
     ] as const;
 
     for (const [query, label] of vectorIndexes) {

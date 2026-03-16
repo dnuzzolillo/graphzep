@@ -26,6 +26,8 @@ export const EntityNodeSchema = BaseNodeSchema.extend({
   summary: z.string(),
   summaryEmbedding: z.array(z.number()).optional(),
   factIds: z.array(z.string()).optional(),
+  metadata: z.record(z.unknown()).optional(),
+  pinned: z.boolean().optional(),
 });
 
 export const EpisodicNodeSchema = BaseNodeSchema.extend({
@@ -135,6 +137,8 @@ export class EntityNodeImpl extends Node implements EntityNode {
   summary: string;
   summaryEmbedding?: number[];
   factIds?: string[];
+  metadata?: Record<string, unknown>;
+  pinned?: boolean;
 
   constructor(data: EntityNode) {
     super(data);
@@ -142,6 +146,8 @@ export class EntityNodeImpl extends Node implements EntityNode {
     this.summary = data.summary;
     this.summaryEmbedding = data.summaryEmbedding;
     this.factIds = data.factIds;
+    this.metadata = data.metadata;
+    this.pinned = data.pinned;
     this.labels = ['Entity', ...this.labels];
   }
 
@@ -155,6 +161,8 @@ export class EntityNodeImpl extends Node implements EntityNode {
       groupId: this.groupId,
       createdAt: this.createdAt.toISOString(),
       factIds: this.factIds || [],
+      metadataJson: JSON.stringify(this.metadata ?? null),
+      pinned: this.pinned ?? false,
     };
 
     const query = `
@@ -164,8 +172,11 @@ export class EntityNodeImpl extends Node implements EntityNode {
           n.summary = $summary,
           n.groupId = $groupId,
           n.createdAt = COALESCE(n.createdAt, datetime($createdAt)),
-          n.factIds = $factIds
+          n.factIds = $factIds,
+          n.metadataJson = $metadataJson,
+          n.pinned = $pinned
       ${this.summaryEmbedding ? 'SET n.summaryEmbedding = $summaryEmbedding, n.embedding = $summaryEmbedding' : ''}
+      ${this.pinned ? 'SET n:Contact' : ''}
       RETURN n
     `;
 
@@ -295,5 +306,53 @@ export class CommunityNodeImpl extends Node implements CommunityNode {
     `;
 
     await driver.executeQuery(query, params);
+  }
+}
+
+/**
+ * Fact node — a consolidated, discrete piece of knowledge extracted by the
+ * Sleep Engine's FactConsolidator. Stored with its own embedding for ANN search.
+ */
+export class FactNodeImpl extends Node {
+  content: string;
+  embedding?: number[];
+  sourceEpisodeIds?: string[];
+  updatedAt?: Date;
+
+  constructor(data: any) {
+    super({
+      uuid: data.uuid,
+      name: data.name ?? data.content?.slice(0, 60) ?? 'Fact',
+      groupId: data.groupId,
+      labels: data.labels ?? ['Fact'],
+      createdAt: data.createdAt ? new Date(data.createdAt) : new Date(),
+    });
+    this.content = data.content ?? '';
+    this.embedding = data.embedding;
+    this.sourceEpisodeIds = data.sourceEpisodeIds;
+    this.updatedAt = data.updatedAt ? new Date(data.updatedAt) : undefined;
+    if (!this.labels.includes('Fact')) this.labels = ['Fact', ...this.labels];
+  }
+
+  async save(driver: GraphDriver): Promise<void> {
+    await driver.executeQuery(
+      `MERGE (f:Fact {uuid: $uuid})
+       SET f.name = $name,
+           f.content = $content,
+           f.embedding = $embedding,
+           f.groupId = $groupId,
+           f.sourceEpisodeIds = $sourceEpisodeIds,
+           f.createdAt = COALESCE(f.createdAt, datetime($createdAt)),
+           f.updatedAt = datetime()`,
+      {
+        uuid: this.uuid,
+        name: this.name,
+        content: this.content,
+        embedding: this.embedding ?? null,
+        groupId: this.groupId,
+        sourceEpisodeIds: this.sourceEpisodeIds ?? [],
+        createdAt: this.createdAt.toISOString(),
+      },
+    );
   }
 }
