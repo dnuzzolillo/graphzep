@@ -191,7 +191,7 @@ export class Consolidator {
       .map((content, i) => `[Episode ${i + 1}]: ${content}`)
       .join('\n\n');
 
-    return `You are maintaining a knowledge graph. Update the summary for a graph entity.
+    return `You are maintaining a knowledge graph. Write a concise, search-optimized summary for an entity.
 
 Entity: "${cluster.name}" (type: ${cluster.entityType})
 Current summary: "${cluster.currentSummary || 'No summary yet.'}"
@@ -199,16 +199,19 @@ Current summary: "${cluster.currentSummary || 'No summary yet.'}"
 New episodes that mention this entity:
 ${episodesText}
 
-Write an updated comprehensive summary of "${cluster.name}" that integrates the current \
-summary with the new evidence from the episodes above.
+Write an updated summary of "${cluster.name}" that integrates the current summary with the new evidence.
 
 Rules:
-- Be factual — only include information directly supported by the evidence
-- Be concise — 2 to 4 sentences
-- Preserve important facts from the current summary unless contradicted
-- Include key roles, relationships, and notable events
-- Preserve ALL attribution facts (named after, dedicated to, founded by, described by, discovered by) — these are irreversible if lost and must never be omitted even for brevity
-- Do not speculate beyond the provided text
+- MAXIMUM 2 sentences, under 40 words total. Shorter summaries produce better vector search matches.
+- Lead with the entity's core identity/role, then add 1 key distinguishing detail.
+- Use specific identifiers: include order numbers, AWBs, email addresses, amounts.
+- Drop generic descriptions — "a major airport" adds nothing; "IATA code MIA" does.
+- Drop temporal details (specific dates, ETAs) — those belong in episodes.
+- Preserve attribution facts (founded by, works at, owned by) — these define identity.
+- Write in the same language as the episodes.
+
+Good: "ORDER-20260128 is a DHL shipment (AWB 947-02230734) from NAS MIA to Safetech."
+Bad: "ORDER-20260128 is a product order in the shipping database, tracked by the operations team with various AWB numbers and status updates over time."
 
 Return JSON with the updated summary and your confidence score.`;
   }

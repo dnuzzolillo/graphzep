@@ -28,7 +28,7 @@ export class OpenAIClient extends BaseLLMClient {
       const completion = await this.client.chat.completions.create({
         model: this.config.model,
         messages: [{ role: 'user', content: prompt }],
-        temperature: this.config.temperature ?? 0.7,
+        ...(this.config.temperature != null ? { temperature: this.config.temperature } : {}),
         max_tokens: this.config.maxTokens,
         top_p: this.config.topP,
         frequency_penalty: this.config.frequencyPenalty,
@@ -113,7 +113,7 @@ export class OpenAIClient extends BaseLLMClient {
       const completion = await this.client.chat.completions.create({
         model: this.config.model,
         messages: [{ role: 'user', content: prompt }],
-        temperature: this.config.temperature ?? 0.7,
+        ...(this.config.temperature != null ? { temperature: this.config.temperature } : {}),
         max_tokens: this.config.maxTokens,
         response_format: {
           type: 'json_object',

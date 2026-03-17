@@ -729,12 +729,18 @@ Return JSON with the merged summary.`;
     const groupId = params.groupId || this.defaultGroupId;
     const limit = Math.floor(params.limit || 10);
 
-    const [entityScored, episodicScored] = await Promise.all([
+    const [entityScored, episodicScored, factScored, keywordFacts] = await Promise.all([
       this._searchEntityCommunity(embedding, groupId, limit),
       this._searchEpisodic(embedding, groupId, limit, params),
+      this._searchFacts(embedding, groupId, limit),
+      this._searchFactsByKeyword(params.query, groupId, limit),
     ]);
 
-    const merged = this._rrfMerge([entityScored, episodicScored], limit);
+    // Merge keyword-matched facts into vector facts (keyword matches fill gaps)
+    const mergedFacts = this._mergeFactResults(factScored, keywordFacts);
+
+    // Facts-first architecture: facts are primary, entity/episodic fill remaining slots
+    let merged = this._factsFirstMerge(mergedFacts, entityScored, episodicScored, limit, params.query);
 
     const scoreMap = new Map<string, number>();
     for (const { node, score } of merged) scoreMap.set(node.uuid, score);
@@ -773,13 +779,19 @@ Return JSON with the merged summary.`;
     const groupId = params.groupId || this.defaultGroupId;
     const limit = Math.floor(params.limit || 10);
 
-    // Run entity+community and episodic searches in parallel, then RRF-merge.
-    const [entityScored, episodicScored] = await Promise.all([
+    // Run entity+community, episodic, and fact searches in parallel.
+    const [entityScored, episodicScored, factScored, keywordFacts] = await Promise.all([
       this._searchEntityCommunity(embedding, groupId, limit),
       this._searchEpisodic(embedding, groupId, limit, params),
+      this._searchFacts(embedding, groupId, limit),
+      this._searchFactsByKeyword(params.query, groupId, limit),
     ]);
 
-    const merged = this._rrfMerge([entityScored, episodicScored], limit);
+    // Merge keyword-matched facts into vector facts (keyword matches fill gaps)
+    const mergedFacts = this._mergeFactResults(factScored, keywordFacts);
+
+    // Facts-first architecture: facts are primary, entity/episodic fill remaining slots
+    let merged = this._factsFirstMerge(mergedFacts, entityScored, episodicScored, limit, params.query);
 
     // Build scoreMap (RRF scores) for temporal weighting downstream.
     const scoreMap = new Map<string, number>();
@@ -1000,6 +1012,173 @@ Return JSON with the merged summary.`;
   }
 
   /**
+   * Keyword-based fact search: find facts that contain specific identifiers
+   * (ORDER numbers, AWB numbers, etc.) from the query.
+   * This supplements vector search which can't distinguish similar IDs.
+   */
+  private async _searchFactsByKeyword(
+    query: string,
+    groupId: string,
+    limit: number,
+  ): Promise<Array<{ node: Node; score: number }>> {
+    const ids = this._extractTypedIdentifiers(query);
+    if (ids.length === 0) return [];
+
+    // Build CONTAINS tokens from the identifiers
+    const tokens = ids.map(id => {
+      if (id.type === 'ORDER') return `ORDER-${id.value}`;
+      if (id.type === 'PO') return `PO${id.value}`;
+      if (id.type === 'AWB') return id.value;
+      return id.value;
+    });
+
+    try {
+      const results = await this.driver.executeQuery<any[]>(
+        `MATCH (n:Fact {groupId: $groupId})
+         WHERE ANY(t IN $tokens WHERE n.content CONTAINS t)
+         RETURN n, labels(n) AS labels, 0.85 AS score
+         LIMIT $limit`,
+        { groupId, tokens, limit: limit * 2 },
+      );
+      return results.map((r: any) => {
+        const d = r.n?.properties ?? r.n;
+        return {
+          node: new FactNodeImpl({ ...d, labels: r.labels ?? ['Fact'] }),
+          score: r.score ?? 0.85,
+        };
+      });
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Merge keyword-matched facts into vector facts.
+   * Keyword matches that aren't already in the vector results get added
+   * with their keyword score. Deduplicates by UUID.
+   */
+  private _mergeFactResults(
+    vectorFacts: Array<{ node: Node; score: number }>,
+    keywordFacts: Array<{ node: Node; score: number }>,
+  ): Array<{ node: Node; score: number }> {
+    if (keywordFacts.length === 0) return vectorFacts;
+
+    const seen = new Set(vectorFacts.map(f => f.node.uuid));
+    const merged = [...vectorFacts];
+    for (const kf of keywordFacts) {
+      if (!seen.has(kf.node.uuid)) {
+        seen.add(kf.node.uuid);
+        merged.push(kf);
+      }
+    }
+    return merged;
+  }
+
+  /**
+   * Facts-first merge: facts are the primary search source (like Mem0).
+   * Entity/episodic results fill remaining slots after facts.
+   *
+   * Strategy:
+   *   1. Take all facts sorted by vector score as the primary results
+   *   2. Apply identifier-aware filtering (penalize facts about wrong ORDER/AWB)
+   *   3. RRF-merge entity + episodic as supplementary results
+   *   4. Interleave: facts get priority slots, supplementary fills the rest
+   */
+  private _factsFirstMerge(
+    factScored: Array<{ node: Node; score: number }>,
+    entityScored: Array<{ node: Node; score: number }>,
+    episodicScored: Array<{ node: Node; score: number }>,
+    limit: number,
+    query?: string,
+  ): Array<{ node: Node; score: number }> {
+    // Identifier-aware filtering: extract specific IDs from the query
+    // and penalize facts that mention DIFFERENT IDs of the same type
+    const queryIds = query ? this._extractTypedIdentifiers(query) : [];
+    const applyIdFilter = queryIds.length > 0;
+
+    // Facts sorted by vector similarity — these are our primary results
+    let facts = factScored
+      .filter(f => f.score > 0.5) // Minimum relevance threshold
+      .slice(0, limit * 2); // Take more candidates for filtering
+
+    if (applyIdFilter) {
+      facts = facts.map(({ node, score }) => {
+        const content = ((node as any).content ?? '').toString();
+        const factIds = this._extractTypedIdentifiers(content);
+        if (factIds.length === 0) return { node, score }; // Neutral — no IDs in fact
+
+        // Check if this fact mentions any of the query's identifiers
+        let hasMatch = false;
+        let hasWrongId = false;
+        for (const qId of queryIds) {
+          for (const fId of factIds) {
+            if (fId.type !== qId.type) continue; // Different ID types — ignore
+            if (fId.value === qId.value) {
+              hasMatch = true; // Exact match — boost
+            } else {
+              hasWrongId = true; // Same type, different value — penalize
+            }
+          }
+        }
+
+        if (hasMatch) return { node, score: score * 1.2 }; // Boost exact matches
+        if (hasWrongId) return { node, score: score * 0.1 }; // Heavy penalty for wrong ID
+        return { node, score };
+      }).sort((a, b) => b.score - a.score);
+    }
+
+    facts = facts.slice(0, limit);
+
+    // RRF-merge entity + episodic as supplementary
+    const supplementary = this._rrfMerge([entityScored, episodicScored], limit);
+
+    // Assign scores: facts get higher base scores than supplementary
+    // This ensures facts rank above supplementary when interleaved
+    const seen = new Set<string>();
+    const merged: Array<{ node: Node; score: number }> = [];
+
+    // Facts first — score normalized to [0.5, 1.0] range
+    for (const { node, score } of facts) {
+      if (!seen.has(node.uuid)) {
+        seen.add(node.uuid);
+        merged.push({ node, score: 0.5 + score * 0.5 });
+      }
+    }
+
+    // Fill remaining slots with supplementary — score in [0.0, 0.5) range
+    for (const { node, score } of supplementary) {
+      if (!seen.has(node.uuid) && merged.length < limit) {
+        seen.add(node.uuid);
+        merged.push({ node, score: score * 0.5 });
+      }
+    }
+
+    return merged.sort((a, b) => b.score - a.score).slice(0, limit);
+  }
+
+  /**
+   * Extract typed identifiers from text — ORDER numbers, AWB numbers, PO numbers.
+   * Returns type + value pairs so we can compare only within the same ID type.
+   * e.g. ORDER-20260128 in query should penalize ORDER-20260120 facts but NOT AWB facts.
+   */
+  private _extractTypedIdentifiers(text: string): Array<{ type: string; value: string }> {
+    const ids: Array<{ type: string; value: string }> = [];
+    // ORDER-XXXXXXXX
+    for (const m of text.matchAll(/ORDER-(\d{5,})/gi)) {
+      ids.push({ type: 'ORDER', value: m[1] });
+    }
+    // PO numbers (POXXXXXXXX)
+    for (const m of text.matchAll(/PO(\d{5,})/gi)) {
+      ids.push({ type: 'PO', value: m[1] });
+    }
+    // AWB numbers (947-XXXXXXXX or standalone 10+ digit sequences after AWB)
+    for (const m of text.matchAll(/AWB[\s-]*(\d{3}-?\d{5,})/gi)) {
+      ids.push({ type: 'AWB', value: m[1].replace(/-/g, '') });
+    }
+    return ids;
+  }
+
+  /**
    * Reciprocal Rank Fusion: merge multiple ranked lists into one.
    * k=60 is the standard constant from the original RRF paper.
    */
@@ -1022,6 +1201,8 @@ Return JSON with the merged summary.`;
     }
     return [...scores.values()].sort((a, b) => b.score - a.score).slice(0, limit);
   }
+
+
 
   /**
    * Re-rank nodes by blending the original semantic similarity score with a
